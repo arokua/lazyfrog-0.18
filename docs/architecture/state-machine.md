@@ -116,6 +116,8 @@ error (can transition from any state)
 | `MISSION_COMPLETED` | Devvit Content | Background | Finish button clicked |
 | `MISSION_FOUND` | Reddit Content | Background | Found mission matching filters |
 | `NO_MISSIONS_FOUND` | Reddit Content | Background | No missions match filters |
+| `GAME_DIALOG_CLOSED` | Background | Background | Dialog confirmed gone; proceed to `navigating` |
+| `DIALOG_CLOSE_TIMEOUT` | Background | Background | Dialog would not close after ~20s; navigate anyway |
 | `ERROR_OCCURRED` | Any Content | Background | Something went wrong |
 | `RETRY` | User/Popup | Background | Retry after error |
 | `NAVIGATE_TO_MISSION` | Background | Background | Internal event to navigate |
@@ -340,9 +342,15 @@ window.autoSupperDebug.sendEvent({ type: 'GAME_LOADER_DETECTED' })
 
 ### Background Service Worker Inspection
 
-1. Go to `chrome://extensions`
-2. Find "Sword & Supper Bot"
-3. Click "Service Worker" under "Inspect views"
+1. Go to `chrome://extensions` and enable **Developer mode** (otherwise the
+   "Inspect views" row is not shown at all)
+2. Find **LazyFrog**
+3. Click **`service worker`** under "Inspect views". If it reads
+   `service worker (inactive)` that is fine — MV3 workers idle out, and
+   clicking wakes it.
+
+The Options page (right-click the toolbar icon → Options → Inspect) has the
+same `chrome.storage` access and is often easier to reach.
 4. Check console for `[StateMachine]` and `[StateTransition]` logs
 
 ### Logging
@@ -384,6 +392,21 @@ console.log(JSON.stringify(toJSON(botMachine), null, 2));
 ```
 
 ## Troubleshooting
+
+### Bot gets stuck in waitingForDialogClose at mission end
+- **Symptom**: `presentationState` sits on `waitingForDialogClose`, the game
+  iframe still shows the victory screen, and the queue never advances even
+  though `lazyfrogBotQueueSnapshot.count` is healthy.
+- **Cause**: `canNavigateAway` answers from the DOM
+  (`isGameDialogOpen() || hasFullscreenGameIframe()`), so a victory screen that
+  keeps the iframe mounted reports "still open" indefinitely.
+- **Fix**: after `DIALOG_CLOSE_MAX_RETRIES` re-checks (~20s) the background
+  fires `DIALOG_CLOSE_TIMEOUT` and navigates anyway, which tears the iframe
+  down. Look for `Dialog did not close in time — advancing to next mission`.
+- **Note**: the `DRY-RUN` in the devvit victory log is *not* the cause. Once a
+  mission is reported complete, `enterMissionDoneNoClick` deliberately stops
+  devvit clicking and hands over to the background. That is expected; it is
+  only a problem when the background itself is wedged.
 
 ### Bot gets stuck in WAITING_FOR_GAME
 - **Cause**: Game loader not detected by MutationObserver
