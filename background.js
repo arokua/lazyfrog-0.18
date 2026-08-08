@@ -3671,6 +3671,17 @@ ${err.message}`);
               GAME_DIALOG_CLOSED: {
                 target: "#bot.navigating"
               },
+              // Escape hatch. Closing the dialog gracefully can fail outright --
+              // e.g. the victory screen keeps the iframe mounted, so the Reddit
+              // side keeps reporting it open. Without this the state had no exit
+              // but GAME_DIALOG_CLOSED and the run hung permanently. Navigating
+              // sets window.location, which tears the iframe down regardless.
+              // The next mission's permalink is already in context: setMission
+              // runs on NEXT_MISSION_FOUND, before this state is entered.
+              DIALOG_CLOSE_TIMEOUT: {
+                target: "#bot.navigating",
+                actions: ["logTransition"]
+              },
               ERROR_OCCURRED: {
                 target: "#bot.error",
                 actions: ["setError", "setCompletionReason"]
@@ -4527,6 +4538,10 @@ ${err.message}`);
   const MISSION_SYNC_PAGE_DELAY_MS = 350;
   /** How long bot start will wait on the freshness sync before carrying on without it. */
   const START_BOT_SYNC_BUDGET_MS = 2e4;
+  /** How often waitingForDialogClose re-checks whether the game dialog has gone. */
+  const DIALOG_CLOSE_RECHECK_MS = 2e3;
+  /** Re-checks before giving up on a graceful close and navigating anyway (~20s). */
+  const DIALOG_CLOSE_MAX_RETRIES = 10;
   const NAVIGATION_SETTLE_MS = 1e4;
   function getMissionMaxAgeCutoffMs(asOfMs = Date.now()) {
     return asOfMs - MISSION_QUEUE_MAX_AGE_DAYS * 24 * 60 * 60 * 1e3;
@@ -7431,8 +7446,25 @@ ${err.message}`);
             } else {
               dialogCloseRetryCount += 1;
               extensionLogger.log("[StateTransition] Dialog still open, will retry close check", {
-                retry: dialogCloseRetryCount
+                retry: dialogCloseRetryCount,
+                maxRetries: DIALOG_CLOSE_MAX_RETRIES
               });
+              // This retry loop used to be unbounded, so a dialog that would not
+              // close held the run forever. Give up and navigate instead.
+              if (dialogCloseRetryCount >= DIALOG_CLOSE_MAX_RETRIES) {
+                extensionLogger.warn(
+                  "[StateTransition] Dialog did not close in time — advancing to next mission anyway",
+                  {
+                    retries: dialogCloseRetryCount,
+                    waitedMs: dialogCloseRetryCount * DIALOG_CLOSE_RECHECK_MS,
+                    nextMission: context?.currentMissionPermalink || null
+                  }
+                );
+                dialogCloseTriggered = false;
+                dialogCloseRetryCount = 0;
+                sendToStateMachine({ type: "DIALOG_CLOSE_TIMEOUT" });
+                return;
+              }
               if (dialogCloseRetryCount % 3 === 0) {
                 sendCloseGameDialog(dialogOwnerTabId, "waitingForDialogClose-retry", dialogOwnerTabId == null);
               }
@@ -7442,7 +7474,7 @@ ${err.message}`);
                   extensionLogger.log("[StateTransition] Re-checking dialog status");
                   handleStateTransition(snapshot, snapshot.context);
                 }
-              }, 2e3);
+              }, DIALOG_CLOSE_RECHECK_MS);
             }
           });
           return;
