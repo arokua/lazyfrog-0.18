@@ -1,5 +1,7 @@
 var reddit = (function() {
   "use strict";
+  // Loaded by manifest.json ahead of this script; see lib/missionCore.js.
+  const missionCore = globalThis.LazyFrogMissionCore;
   function defineContentScript(definition2) {
     return definition2;
   }
@@ -927,27 +929,7 @@ var reddit = (function() {
     }
     return 0;
   }
-  function parseLevelRangeFromFlairText(flairText) {
-    if (!flairText) return null;
-    const normalized = String(flairText).replace(/[\u2013\u2014–—]/g, "-").replace(/★/g, "").trim();
-    const patterns = [
-    /(?:levels?|level|lv\.?)\s*(\d+)\s*-\s*(\d+)/i,
-    /(\d+)\s*-\s*(\d+)\s*(?:levels?|level)/i,
-    /^(\d+)\s*-\s*(\d+)$/,
-    /(?:^|\s)(\d{1,4})\s*-\s*(\d{1,4})(?:\s|$)/
-    ];
-    for (const pattern of patterns) {
-      const match = normalized.match(pattern);
-      if (!match) continue;
-      const minLevel = parseInt(match[1], 10);
-      const maxLevel = parseInt(match[2], 10);
-      if (!Number.isFinite(minLevel) || !Number.isFinite(maxLevel) || minLevel > maxLevel) {
-        continue;
-      }
-      return { minLevel, maxLevel };
-    }
-    return null;
-  }
+  const parseLevelRangeFromFlairText = missionCore.parseLevelRangeFromFlair;
   function extractFlairTextFromPostElement(post) {
     const flairLink = post.querySelector('a[href*="flair_name"]');
     if (flairLink?.textContent?.trim()) {
@@ -1014,10 +996,20 @@ var reddit = (function() {
     if (!level.postId || !level.href) {
       return;
     }
-    if (!level.levelRangeMin || !level.levelRangeMax) {
+    // Classify from the flair text the DOM scan already read. A Daily Dungeon
+    // carries no level range, so gating purely on levels -- as this did before --
+    // silently dropped every one of them.
+    const classification = missionCore.classifyMission({
+      flairText: level.levelRange || "",
+      title: level.title,
+      postedAt: level.postedAt || 0,
+      now: Date.now()
+    });
+    if (classification.kind === missionCore.MissionKind.NOT_MISSION) {
       return;
     }
-    if (level.levelRangeMax < level.levelRangeMin) {
+    const hasLevels = !!level.levelRangeMin && !!level.levelRangeMax && level.levelRangeMax >= level.levelRangeMin;
+    if (!hasLevels && classification.kind !== missionCore.MissionKind.DAILY_DUNGEON) {
       return;
     }
     try {
@@ -1053,8 +1045,10 @@ var reddit = (function() {
         missionAuthorName: existing?.missionAuthorName || level.author || "Unknown",
         environment: existing?.environment || "",
         encounters: existing?.encounters || [],
-        minLevel: level.levelRangeMin,
-        maxLevel: level.levelRangeMax,
+        flairText: level.levelRange || existing?.flairText || "",
+        missionKind: classification.kind,
+        minLevel: hasLevels ? level.levelRangeMin : existing?.minLevel ?? missionCore.PLACEHOLDER_MIN_LEVEL,
+        maxLevel: hasLevels ? level.levelRangeMax : existing?.maxLevel ?? missionCore.PLACEHOLDER_MAX_LEVEL,
         difficulty: Math.max(Number(level.stars) || 0, Number(existing?.difficulty) || 0, Number(existing?.stars) || 0),
         foodImage: existing?.foodImage || "",
         // Dashboard uses foodName as the visible mission title.
@@ -1828,32 +1822,17 @@ var reddit = (function() {
       });
     });
   }
-  function normalizeStarFilter(stars) {
-    if (!Array.isArray(stars)) return [];
-    return stars.map((s) => Number(s)).filter((s) => Number.isFinite(s) && s >= 1 && s <= 5);
-  }
-  function isAllStarsSelected(stars) {
-    const normalized = normalizeStarFilter(stars);
-    return normalized.length === 0 || normalized.length === 5 && [1, 2, 3, 4, 5].every((d) => normalized.includes(d));
-  }
-  function getMissionStarDifficulty(mission) {
-    const difficulty = Number(mission?.difficulty);
-    if (Number.isFinite(difficulty) && difficulty > 0) {
-      return Math.max(1, Math.min(5, Math.round(difficulty)));
-    }
-    const stars = Number(mission?.stars);
-    if (Number.isFinite(stars) && stars > 0) {
-      return Math.max(1, Math.min(5, Math.round(stars)));
-    }
-    return 0;
-  }
+  const normalizeStarFilter = missionCore.normalizeStarFilter;
+  const isAllStarsSelected = missionCore.isAllStarsSelected;
+  const getMissionStarDifficulty = missionCore.getMissionStarDifficulty;
   function normalizeAutomationFilters(filters) {
     const source = filters || {};
     return {
       stars: normalizeStarFilter(source.stars),
       minLevel: source.minLevel !== void 0 ? Number(source.minLevel) : void 0,
       maxLevel: source.maxLevel !== void 0 ? Number(source.maxLevel) : void 0,
-      targetEssences: Array.isArray(source.targetEssences) ? source.targetEssences : []
+      targetEssences: Array.isArray(source.targetEssences) ? source.targetEssences : [],
+      includeDailyDungeon: source.includeDailyDungeon === true
     };
   }
   function missionMatchesEssenceFilter(mission, targetEssences, dictionary) {
@@ -1883,14 +1862,8 @@ var reddit = (function() {
     return false;
   }
   async function getFilteredUnclearedMissions(filters) {
-    const MISSION_QUEUE_MAX_AGE_DAYS = 30;
-    const queueAgeCutoffMs = Date.now() - MISSION_QUEUE_MAX_AGE_DAYS * 24 * 60 * 60 * 1e3;
-    const getMissionPostedMsLocal = (mission) => {
-      if (typeof mission?.postedAt === "number" && mission.postedAt > 0) return mission.postedAt;
-      if (typeof mission?.createdUtc === "number" && mission.createdUtc > 0) return mission.createdUtc * 1e3;
-      if (typeof mission?.timestamp === "number" && mission.timestamp > 0) return mission.timestamp;
-      return null;
-    };
+    const queueAgeCutoffMs = Date.now() - missionCore.ARCHIVE_AFTER_DAYS * missionCore.DAY_MS;
+    const getMissionPostedMsLocal = missionCore.getMissionPostedMs;
     const [missions2, progress, dictionary] = await Promise.all([getAllMissions(), getAllUserProgress(), getEssenceLootDictionary()]);
     const nonMissionList = await new Promise((resolve) => {
       chrome.storage.local.get([STORAGE_KEYS.NON_MISSION_POSTS], (result2) => {
@@ -1909,6 +1882,15 @@ var reddit = (function() {
     const allStarsSelected = isAllStarsSelected(starFilter);
     let unclearedMissions = Object.values(missions2).filter((m) => {
       if (nonMissionSet.has(m.postId) || nonMissionSet.has(String(m.postId || "").replace(/^t3_/, ""))) {
+        return false;
+      }
+      // Same gating as the background queue: archived tombstones hold no playable
+      // data, Cloak/unflaired posts are not missions, and Daily Dungeons are a
+      // separate game mode that is opt-in.
+      if (missionCore.isTombstone(m)) {
+        return false;
+      }
+      if (!missionCore.isMissionKindQueueable(m, normalizedFilters)) {
         return false;
       }
       if (progress.cleared.includes(m.postId) || progress.disabled.includes(m.postId)) {

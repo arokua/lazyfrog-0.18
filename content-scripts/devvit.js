@@ -2624,6 +2624,14 @@ var devvit = (function() {
         const existingMission = await getMission(postId);
         const permalink = postId.startsWith("t3_") ? `https://www.reddit.com/r/SwordAndSupperGame/comments/${postId.slice(3)}/` : "";
         const record = {
+          // saveMission overwrites the stored record wholesale, so fields this
+          // path knows nothing about have to be carried forward explicitly.
+          // Losing postedAt/createdUtc here previously made the mission look
+          // undated, which the archive and queue-age rules both depend on.
+          ...(existingMission?.postedAt !== void 0 ? { postedAt: existingMission.postedAt } : {}),
+          ...(existingMission?.createdUtc !== void 0 ? { createdUtc: existingMission.createdUtc } : {}),
+          ...(existingMission?.flairText !== void 0 ? { flairText: existingMission.flairText } : {}),
+          ...(existingMission?.missionKind !== void 0 ? { missionKind: existingMission.missionKind } : {}),
           postId,
           timestamp: existingMission?.timestamp || Date.now(),
           permalink,

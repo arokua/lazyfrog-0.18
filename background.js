@@ -4525,6 +4525,8 @@ ${err.message}`);
   const MISSION_SYNC_SEARCH_SLICE_DAYS = 1;
   const MISSION_SYNC_SEARCH_MAX_PAGES = 40;
   const MISSION_SYNC_PAGE_DELAY_MS = 350;
+  /** How long bot start will wait on the freshness sync before carrying on without it. */
+  const START_BOT_SYNC_BUDGET_MS = 2e4;
   const NAVIGATION_SETTLE_MS = 1e4;
   function getMissionMaxAgeCutoffMs(asOfMs = Date.now()) {
     return asOfMs - MISSION_QUEUE_MAX_AGE_DAYS * 24 * 60 * 60 * 1e3;
@@ -7758,6 +7760,18 @@ ${err.message}`);
           automationConfig: stored.automationConfig || {},
           automationFilters: filters
         });
+        // Pull in missions posted since the last run. Previously the queue was
+        // only refreshed from Reddit once it ran completely dry, so a non-empty
+        // queue meant new posts were never picked up without pressing Sync by
+        // hand. ensureLatestMissionSync keeps its own 2 minute cache, and the
+        // race keeps a slow sync from holding up the start -- it carries on in
+        // the background and lands in time for the next queue lookup.
+        await Promise.race([
+          ensureLatestMissionSync(filters).catch((error) => {
+            extensionLogger.warn("[START_BOT] Startup mission sync failed", { error: String(error) });
+          }),
+          new Promise((resolve) => setTimeout(resolve, START_BOT_SYNC_BUDGET_MS))
+        ]);
         console.log("[LazyFrog:RunGate] BG_START_BOT_SEND", {
           ts: Date.now(),
           resumeState: getPresentationStateName(getStateMachineSnapshot())

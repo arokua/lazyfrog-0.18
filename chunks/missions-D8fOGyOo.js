@@ -12835,6 +12835,9 @@ const DEFAULT_ESSENCE_LOOT_DICTIONARY = {
     }
   }
 };
+// Shared mission rules. options.html / popup.html load lib/missionCore.js as a
+// classic script before this module, so the global is already populated here.
+const missionCore = globalThis.LazyFrogMissionCore;
 const STORAGE_KEYS = {
   MISSIONS: "missions",
   // Mission data (static, from database)
@@ -13602,6 +13605,15 @@ async function getFilteredUnclearedMissions(filters, options = {}) {
     if (nonMissionSet.has(m.postId) || nonMissionSet.has(String(m.postId).replace(/^t3_/, ""))) {
       return false;
     }
+    // Matches the background and reddit queue gating: archived tombstones carry
+    // no playable data, Cloak/unflaired posts are not missions, and Daily
+    // Dungeons are a separate game mode that must be opted into.
+    if (missionCore.isTombstone(m)) {
+      return false;
+    }
+    if (!missionCore.isMissionKindQueueable(m, normalizedFilters)) {
+      return false;
+    }
     if (progress.cleared.includes(m.postId) || progress.disabled.includes(m.postId)) {
       return false;
     }
@@ -13849,15 +13861,21 @@ async function deleteMissions(postIds, options = {}) {
   const removedIds = [];
   for (const id of ids) {
     const short = id.replace(/^t3_/, "");
+    // A mission can be stored under both its full t3_ key and a legacy short
+    // key. Remove both, but count the mission once -- this previously reported
+    // double the number actually deleted.
+    let removedThis = false;
     if (missions2[id]) {
       delete missions2[id];
-      deleted++;
-      removedIds.push(id);
+      removedThis = true;
     }
     if (missions2[short]) {
       delete missions2[short];
+      removedThis = true;
+    }
+    if (removedThis) {
       deleted++;
-      if (!removedIds.includes(id)) removedIds.push(id);
+      removedIds.push(id);
     }
   }
   if (removedIds.length) {
@@ -13872,17 +13890,25 @@ async function deleteMissions(postIds, options = {}) {
   return { deleted, tagged, removedIds: ids };
 }
 async function pruneUnflairedJunkMissions(options = {}) {
-  const daysBack = options.daysBack ?? 30;
   const tagAsNonMission = options.tagAsNonMission !== false;
-  const cutoffMs = Date.now() - daysBack * 24 * 60 * 60 * 1e3;
+  const now = Date.now();
   const missions2 = await getAllMissions();
   const toRemove = [];
   for (const [postId, mission] of Object.entries(missions2)) {
     if (!mission) continue;
+    if (missionCore.isTombstone(mission)) continue;
+    // Only genuine junk is prunable. A Daily Dungeon has no level flair by
+    // design and so always looks like a placeholder here; without this guard it
+    // would be deleted and permanently blacklisted.
+    const kind = missionCore.getMissionKind(mission);
+    if (kind !== missionCore.MissionKind.NOT_MISSION && kind !== missionCore.MissionKind.UNKNOWN) continue;
     if (!isPlaceholderLevelRange(mission)) continue;
     if (mission.devvitEnrichedAt) continue;
-    const postedMs = getMissionPostedMsFromFields(mission) || (typeof mission.timestamp === "number" && mission.timestamp > 0 ? mission.timestamp : null);
-    if (postedMs && postedMs < cutoffMs) continue;
+    const postedMs = missionCore.getMissionPostedMs(mission);
+    // Give the post its full grace window to acquire a flair first. This
+    // comparison used to be inverted, keeping stale placeholders and deleting
+    // fresh ones that were merely waiting on a moderator to apply flair.
+    if (postedMs && now - postedMs < missionCore.FLAIR_GRACE_MS) continue;
     const full = normalizePostIdFull(postId);
     if (full) {
       toRemove.push(full);
@@ -13935,21 +13961,36 @@ async function cleanupArchivedMissions(days = 30) {
       lookupFailed = error instanceof Error ? error.message : String(error);
     }
   }
+  // Collapse to tombstones rather than deleting. Keeping an id + date record
+  // means cleared history in userProgress stays meaningful and sync will not
+  // re-add the post later; the old behaviour deleted the record and then
+  // stripped the matching progress entries, losing both.
   const removedIds = [...toDelete];
+  let bytesBefore = 0;
+  let bytesAfter = 0;
+  let archived = 0;
   for (const postId of removedIds) {
-    delete missions2[postId];
+    const mission = missions2[postId];
+    if (!mission || missionCore.isTombstone(mission)) continue;
+    const tombstone = missionCore.buildArchivedTombstone({ ...mission, postId: mission.postId || postId });
+    if (!tombstone) continue;
+    bytesBefore += JSON.stringify(mission).length;
+    bytesAfter += JSON.stringify(tombstone).length;
+    missions2[postId] = tombstone;
+    archived++;
   }
   await persistMissionsObject(missions2);
-  const progressPruned = await pruneUserProgressPostIds(removedIds);
   return {
-    removed: removedIds.length,
+    removed: archived,
+    archived,
     removedIds,
     kept: Object.keys(missions2).length,
+    bytesFreed: Math.max(0, bytesBefore - bytesAfter),
     cutoffMs,
     cutoffIso: new Date(cutoffMs).toISOString(),
     needsLookup: needsLookup.length,
     enrichedPostedAt,
-    progressPruned,
+    progressPruned: 0,
     lookupFailed,
     lookupSkipped: lookupFailed ? needsLookup.length : 0
   };
