@@ -5779,9 +5779,7 @@ ${err.message}`);
     return tabsScanned;
   }
   async function pruneUnflairedJunkMissionsFromStorage(options = {}) {
-    const daysBack = options.daysBack ?? MISSION_SYNC_DAYS;
     const tagAsNonMission = options.tagAsNonMission !== false;
-    const cutoffMs = Date.now() - daysBack * 24 * 60 * 60 * 1e3;
     const allMissions = await getAllMissions();
     const toRemove = [];
     const now = Date.now();
@@ -5841,7 +5839,7 @@ ${err.message}`);
     extensionLogger.log("[MissionSync] Pruned unflaired junk placeholders", {
       removed,
       tagged,
-      daysBack
+      graceHours: missionCore.FLAIR_GRACE_MS / 36e5
     });
     return { removed, tagged };
   }
@@ -5961,7 +5959,7 @@ ${err.message}`);
     const storageFlairBackfill = await backfillPlaceholderMissionsInStorage(placeholderCutoffMs, {
       maxCount: 800
     });
-    const prunedJunk = await pruneUnflairedJunkMissionsFromStorage({ daysBack, tagAsNonMission: true });
+    const prunedJunk = await pruneUnflairedJunkMissionsFromStorage({ tagAsNonMission: true });
     const archivedOld = await archiveOldMissions();
     const enrichment = runEnrichment ? await runMissionMetadataEnrichment({
       postIds: persistResult.newlyAddedPostIds,

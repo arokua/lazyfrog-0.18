@@ -1362,7 +1362,7 @@ const SettingsTab = () => {
         const { pruneUnflairedJunkMissions: pruneUnflairedJunkMissions2 } = await import("./missions-D8fOGyOo.js").then((n) => n.q);
         return { pruneUnflairedJunkMissions: pruneUnflairedJunkMissions2 };
       }, true ? [] : void 0);
-      const result = await pruneUnflairedJunkMissions({ daysBack: 30, tagAsNonMission: true });
+      const result = await pruneUnflairedJunkMissions({ tagAsNonMission: true });
       alert(`Removed ${result.removed} junk placeholder(s). Tagged ${result.tagged} as not-missions.`);
     } catch (error) {
       alert(`Prune failed: ${error instanceof Error ? error.message : String(error)}`);
