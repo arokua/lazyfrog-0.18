@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "LazyFrog",
+  "description": "Automation bot for the Sword & Supper Reddit game. Catalogs missions and plays them!",
+  "version": "0.16.1",
+  "icons": {
+    "16": "/icons/icon16.png",
+    "32": "/icons/icon32.png",
+    "48": "/icons/icon48.png",
+    "128": "/icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "webNavigation",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://www.reddit.com/*",
+    "https://*.devvit.net/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "autosupper@akj.io"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "fetchInterceptor.js",
+        "missionDataFetcher.js",
+        "pageWorldKeepAlive.js"
+      ],
+      "matches": ["https://www.reddit.com/*", "https://*.devvit.net/*"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "LazyFrog",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.devvit.net/*"],
+      "all_frames": true,
+      "run_at": "document_start",
+      "js": ["content-scripts/devvit.js", "content-scripts/autosell.js"]
+    },
+    {
+      "matches": ["https://www.reddit.com/*"],
+      "run_at": "document_start",
+      "js": ["content-scripts/reddit.js"]
+    }
+  ]
+}

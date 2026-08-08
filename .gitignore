@@ -1,0 +1,24 @@
+# --- Secrets: never commit ---
+scripts/.google_oauth_client.json
+scripts/token.json
+scripts/tokens.json
+*.pem
+*.key
+
+# --- Separately version-controlled ---
+# old source/LazyFrog is its own git clone (github.com/Saturate/LazyFrog).
+# Tracking it here would nest repositories.
+old source/
+
+# --- Generated / runtime ---
+node_modules/
+__pycache__/
+*.pyc
+Logs/sessions/
+Logs/all.txt
+Logs/*.jsonl
+
+# --- OS noise ---
+Thumbs.db
+desktop.ini
+.DS_Store

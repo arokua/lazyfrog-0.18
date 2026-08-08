@@ -1,0 +1,3 @@
+# These are built bundles edited in place. Disable EOL normalization so diffs
+# show only real changes, never whole-file line-ending churn.
+* -text

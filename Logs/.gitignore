@@ -1,0 +1,5 @@
+# Runtime log output — keep folder structure only
+sessions/
+index.md
+!README.md
+!/.gitignore

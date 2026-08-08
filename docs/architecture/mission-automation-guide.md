@@ -1,0 +1,284 @@
+# Mission Automation Guide
+
+## Overview
+This guide documents how to automate mission playback in Sword & Supper based on mission metadata.
+
+## Mission Flow
+
+### 1. Opening a Mission
+**Location**: Reddit post page (e.g., `/r/SwordAndSupperGame/comments/{postId}/`)
+
+**What Happens**:
+- Game loads in an iframe within a modal dialog
+- Console logs `missionMetadata` containing complete mission structure
+- **No life is at stake yet** - you can close without penalty
+
+**Available Data** (from console `initialData`):
+```json
+{
+  "missionMetadata": {
+    "mission": {
+      "environment": "mossy_forest",
+      "encounters": [...],  // Array of encounter objects
+      "minLevel": 1,
+      "maxLevel": 5,
+      "difficulty": 2,
+      "foodName": "Maple-Glazed Bacon",
+      "rarity": "uncommon"
+    },
+    "missionTitle": "...",
+    "missionAuthorName": "...",
+    "scenarioText": "..."
+  },
+  "playerStats": {...},
+  "questProgress": {...}
+}
+```
+
+### 2. Encounter Types
+
+The `encounters` array defines the mission structure. Each encounter is one of:
+
+#### A. Enemy Encounter
+```json
+{
+  "type": "enemy",
+  "enemies": [
+    {"id": "darkBat-0-0", "type": "darkBat", "level": -2},
+    {"id": "darkHand-0-1", "type": "darkHand", "level": -1}
+  ]
+}
+```
+**UI**: Shows "Battle" button
+**Action**: Click "Battle" to start auto-combat
+**Result**: Victory or defeat, loot awarded
+
+#### B. Skill Bargain
+```json
+{
+  "type": "skillBargain",
+  "positiveEffect": {"type": "multiplier", "stat": "Dodge", "amount": 0.17},
+  "negativeEffect": {"type": "health", "amount": -0.17}
+}
+```
+**UI**: Shows choice buttons (Accept/Decline)
+**Action**: Choose whether to accept the trade-off
+**Result**: Stats modified for remainder of mission
+
+#### C. Ability Choice
+```json
+{
+  "type": "abilityChoice",
+  "isEnchanted": false,
+  "optionA": {"type": "ability", "abilityId": "IceKnifeOnTurnStart"},
+  "optionB": {"type": "ability", "abilityId": "LightningOnCrit"},
+  "optionC": {"type": "ability", "abilityId": "HealOnFirstTurn"}
+}
+```
+**UI**: Shows 3 ability option buttons
+**Action**: Choose one ability
+**Result**: Ability unlocked for character
+
+#### D. Treasure
+```json
+{
+  "type": "treasure",
+  "missionType": "standard",
+  "reward": {
+    "essences": [
+      {"id": "EssenceCrunchy", "quantity": 2},
+      {"id": "EssenceHearty", "quantity": 2}
+    ],
+    "tier": 2
+  }
+}
+```
+**UI**: Shows victory screen with:
+- Large "VICTORY" banner with crown graphic
+- Message: "You found the [FoodName] recommended by u/[AuthorName]!"
+- "FLAVOR ESSENCES" section displaying reward items with quantities
+- Blue "Continue" button at bottom
+**Action**: Click "Continue" button to complete mission
+**Result**: Items added to inventory, mission marked as cleared, can close and return to Reddit feed
+
+### 3. Combat Details
+
+**Combat Start**:
+- Console logs: `Combat start!`
+- Automatic turn-based combat executes
+- Each turn logs attacks and damage
+
+**Combat Logs Example**:
+```
+----TURN START----
+darkBat-0-0 attacks player for 6 damage!
+----TURN END----
+----TURN START----
+player attacks darkBat-0-0 for 16 damage!
+----TURN END----
+...
+darkBat-0-0 is dead!
+```
+
+**Combat End**:
+- Console logs: `Encounter result: {"victory":true, "encounterLoot":[...]}`
+- Inventory updated via `inventoryQueryResponse` message
+- Quest progress updated via `questProgressUpdate` message
+- Returns to mission map, next encounter button appears
+
+### 4. Mission Completion
+
+**After all encounters**:
+- Game automatically transitions to treasure encounter (no button click needed)
+- Victory screen displays with:
+  - Crown graphic and "VICTORY" banner
+  - Food reward message
+  - List of essence rewards with quantities
+  - Blue "Continue" button
+- Click "Continue" to finalize mission completion
+- No console log for treasure encounter result (unlike enemy encounters)
+- Mission marked as "cleared" after clicking Continue
+- Can close mission dialog and return to Reddit feed
+
+## Automation Strategy
+
+### Phase 1: Metadata Capture
+1. **Detect mission page load** - Look for `initialData` / `devvit-message` (or `/api/init?mode=game` in the Devvit iframe)
+2. **Open game preview on the post** - Metadata is only reliable after the Devvit iframe loads (preview click is safe; no life at stake per guide §1)
+3. **Extract mission metadata** - Parse `missionMetadata` JSON (`environment`, `difficulty`, `encounters`, …)
+4. **Store encounter sequence** - Save the ordered list of encounters (`devvitEnrichedAt` in extension storage)
+
+**Bulk / scale:** Do not open a preview per mission. Use Devvit gateway GRPC from one Reddit tab (parallel requests). Cap enrich runs (default 50 newest). The bot lazy-enriches only the next queued mission via GRPC (~1 request). Preview + `initialData` is a slow fallback for a single mission when GRPC returns empty.
+
+### Phase 2: Encounter Navigation
+Based on current encounter type from metadata:
+
+```javascript
+function handleEncounter(encounterData, encounterIndex) {
+  switch(encounterData.type) {
+    case 'enemy':
+      // Look for "Battle" button and click it
+      clickButton('Battle');
+      // Wait for combat to complete (watch for "Encounter result" log)
+      waitForCombatEnd();
+      break;
+
+    case 'skillBargain':
+      // Decision logic: accept or decline based on player stats/strategy
+      const shouldAccept = evaluateSkillBargain(encounterData);
+      clickButton(shouldAccept ? 'Accept' : 'Decline');
+      break;
+
+    case 'abilityChoice':
+      // Decision logic: choose best ability for build
+      const bestAbility = selectBestAbility(encounterData);
+      clickAbilityOption(bestAbility);
+      break;
+
+    case 'treasure':
+      // Click "Collect" or wait for auto-collect
+      waitForTreasureCollection();
+      break;
+  }
+}
+```
+
+### Phase 3: Decision Making
+
+**For Enemy Encounters**:
+- Always click "Battle" (no choice needed)
+- Monitor combat logs for victory/defeat
+- If defeat: mission fails, lose a life
+
+**For Skill Bargains**:
+- Evaluate trade-offs based on:
+  - Current player HP
+  - Remaining encounters in mission
+  - Positive vs negative effect magnitude
+- Simple strategy: Accept if positive > negative OR if early in mission
+
+**For Ability Choices**:
+- Use a configurable ability tier list system
+- Users can rank abilities by preference
+- Automation selects the highest-ranked available ability
+- Example tier list strategy (offensive focus):
+  1. `IceKnifeOnTurnStart` - High damage, kills enemies faster (reduces damage taken)
+  2. `LightningOnCrit` - Additional damage on critical hits
+  3. `HealOnFirstTurn` - Defensive fallback option
+- Tier list should be stored in extension settings
+- Format: Array of abilityId strings in preference order
+
+### Phase 4: Progress Tracking
+
+**Console Log Monitors**:
+```javascript
+// Listen for these console events:
+- "Combat start!" → Combat beginning
+- "Encounter result: {...}" → Combat ended with result
+- "devvit-message" with type "inventoryQueryResponse" → Loot received
+- "devvit-message" with type "questProgressUpdate" → Quest progress updated
+```
+
+**State Machine**:
+```
+MISSION_START → ENCOUNTER_1 → [COMBAT|CHOICE] → ENCOUNTER_2 → ... → TREASURE → MISSION_COMPLETE
+```
+
+## Example Mission Walkthrough
+
+**Mission**: "Treasure and Maple-Glazed Bacon In the Mossy Forest"
+**Encounters**: 7 total
+
+1. **Encounter 0** (enemy): darkBat + darkHand → Click "Battle" → Victory → +32 Gold
+2. **Encounter 1** (enemy): darkBat → Click "Battle" → (waiting for combat...)
+3. **Encounter 2** (enemy): 2x darkBat → Click "Battle"
+4. **Encounter 3** (skillBargain): +17% Dodge / -17% HP → Choose Accept/Decline
+5. **Encounter 4** (abilityChoice): Ice/Lightning/Heal → Choose one
+6. **Encounter 5** (enemy): darkBat → Click "Battle"
+7. **Encounter 6** (treasure): 2x Crunchy Essence, 2x Hearty Essence → Collect
+
+## Implementation Notes
+
+### Button Detection
+Buttons don't have accessible text in the accessibility tree from outside the iframe. Need to:
+1. Use Chrome DevTools MCP to take snapshots
+2. Look for button elements with specific text content
+3. Click using element coordinates or IDs
+
+### Cross-Origin Iframe Limitations
+The game runs in `devvit.net` domain iframe - we **cannot** directly access its DOM due to CORS. Solutions:
+1. **Console Log Monitoring**: Parse console messages (works!)
+2. **Accessibility Tree**: Use MCP snapshots to see button text
+3. **Visual Detection**: OCR or image recognition (not needed for now)
+
+### Automation Triggers
+**Option A: Extension watches console logs**
+- Add console log listener in content script
+- Parse mission metadata on load
+- Trigger button clicks based on encounter type
+
+**Option B: Manual trigger with automation**
+- User opens mission manually
+- Clicks "Auto-Play" button in extension
+- Extension takes over from current encounter
+
+## Next Steps
+
+1. ✅ Document mission flow (COMPLETE - observed all 7 encounters)
+2. ✅ Document ability tier list system (COMPLETE - added to automation strategy)
+3. ✅ Capture mission metadata via Devvit (`/api/init`, `initialData`, gateway `RenderPostContent`)
+4. ✅ Mission metadata parser + dashboard enrich (sync / manual Devvit enrich button)
+5. ⬜ Implement button click automation for encounters
+6. ⬜ Add decision logic for skill bargains and abilities
+7. ✅ Ability tier list configuration UI (options)
+8. ⬜ Test full mission auto-play
+
+## Summary of Observations
+
+**Complete Mission Playthrough Observed**:
+- ✅ Enemy encounters (4 total) - All show "Battle" button, auto-combat with console logs
+- ✅ Skill Bargain - Shows text choice buttons, immediate HP effect visible
+- ✅ Ability Choice - Shows 3 ability name buttons, Ice Knife chosen for offensive strategy
+- ✅ Treasure - Victory screen with essences, "Continue" button to complete
+
+**Key Insight**: Ice Knife (`IceKnifeOnTurnStart`) is highly effective as it deals massive damage at turn start, killing enemies faster and reducing total damage taken. This should be prioritized in the ability tier list.
