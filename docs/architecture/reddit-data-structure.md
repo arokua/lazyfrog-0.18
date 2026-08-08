@@ -375,16 +375,38 @@ interface MissionRecord {
   minLevel?: number;           // From flair
   maxLevel?: number;           // From flair
 
+  // Classification (see docs/architecture/mission-classification.md):
+  flairText?: string;          // Raw Reddit flair
+  missionKind?: 'mission' | 'dailyDungeon' | 'notMission' | 'unknown';
+                               // Absent means 'mission' (legacy records)
+
+  // Posting time — drives archival and the queue age limit:
+  postedAt?: number;           // ms
+  createdUtc?: number;         // seconds, as Reddit reports it
+
   // Enriched data (available after playing):
   metadata: MissionMetadata | null;  // Full mission data from game
   tags?: string;               // Generated tags
   environment?: string;        // Map type
+  devvitEnrichedAt?: number;   // Set on successful gRPC / init enrichment
 
   // Progress tracking:
   completed: boolean;
   completedAt?: number;
 }
 ```
+
+Two lifecycle states reduce a record in place:
+
+- `compactCleared: true` — cleared missions drop `encounters`, `foodImage`,
+  `rarity`, `chef`, `cart`, `authorWeaponId` and `type`.
+- `archived: true` — a **tombstone**. Past Reddit's ~30 day archive window a
+  record keeps only `postId`, `postedAt` and `createdUtc`; everything else is
+  dropped. The record is retained rather than deleted so cleared history stays
+  meaningful and sync will not re-add the post.
+
+> Progress lives in `userProgress`, keyed by username — **not** on the mission
+> record. The `completed` / `completedAt` fields above are legacy.
 
 ### Why This Approach?
 

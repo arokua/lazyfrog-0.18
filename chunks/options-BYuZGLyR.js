@@ -1299,9 +1299,33 @@ const SettingsTab = () => {
       alert("All missions cleared!");
     }
   };
+  const handleReclassifyMissions = async () => {
+    if (!window.confirm(
+      "Re-read Reddit flair for stored missions and classify them?\n\nMissions saved before flair classification have no kind recorded. This fetches their flair in batches of 100 and tags each as a mission, a Daily Dungeon, or not a mission.\n\nSafe to re-run; already-classified missions are skipped."
+    )) {
+      return;
+    }
+    try {
+      const result = await chrome.runtime.sendMessage({ type: "RECLASSIFY_MISSIONS" });
+      if (!result?.success) {
+        alert(`Reclassify failed: ${result?.error || "unknown error"}`);
+        return;
+      }
+      const byKind = Object.entries(result.byKind || {})
+        .map(([kind, count]) => `  ${kind}: ${count}`)
+        .join("\n");
+      alert(
+        `Classified ${result.updated} of ${result.scanned} mission(s).` +
+        (byKind ? `\n\n${byKind}` : "") +
+        (result.unresolved ? `\n\n${result.unresolved} could not be looked up (deleted or removed posts) and were left unchanged.` : "")
+      );
+    } catch (error) {
+      alert(`Reclassify failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const handleCleanupArchivedMissions = async () => {
     if (!window.confirm(
-      "Remove mission entries posted more than 30 days ago? Valid active missions are typically within the last 30 days. Missions without a stored post date will be checked via Reddit API (may take a moment). This cannot be undone."
+      "Collapse missions posted more than 30 days ago to tombstones?\n\nReddit archives posts after ~30 days, so they can no longer be played. Each one is reduced to its post id and date; all other metadata is dropped. The record itself is kept, so your cleared history stays intact.\n\nMissions without a stored post date are checked via the Reddit API (may take a moment)."
     )) {
       return;
     }
@@ -1311,12 +1335,12 @@ const SettingsTab = () => {
         return { cleanupArchivedMissions: cleanupArchivedMissions2 };
       }, true ? [] : void 0);
       const result = await cleanupArchivedMissions(30);
-      let message = `Removed ${result.removed} archived mission(s). ${result.kept} kept.`;
+      let message = `Archived ${result.archived ?? result.removed} mission(s) to tombstones. ${result.kept} record(s) kept.`;
+      if (result.bytesFreed) {
+        message += `\nReclaimed ~${(result.bytesFreed / 1024).toFixed(0)} KB of metadata.`;
+      }
       if (result.enrichedPostedAt) {
         message += `\nStored Reddit post dates for ${result.enrichedPostedAt} mission(s).`;
-      }
-      if (result.progressPruned) {
-        message += `\nPruned ${result.progressPruned} cleared-progress record(s).`;
       }
       if (result.lookupFailed) {
         message += `\nReddit date lookup failed: ${result.lookupFailed}\nMissions without a known post date were kept.`;
@@ -1883,7 +1907,22 @@ const SettingsTab = () => {
         )
       ] }),
       /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { style: { marginBottom: "16px" }, children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "14px", marginBottom: "12px" }, children: "Remove missions posted more than 30 days ago. Valid non-archived missions are typically within the last 30 days. Uses stored post dates when available; otherwise checks Reddit API in batches. Also prunes matching cleared/disabled progress entries." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "14px", marginBottom: "12px" }, children: "Classify stored missions by their Reddit flair: mission, Daily Dungeon, or not a mission. Missions saved before flair classification have no kind recorded, so they are all treated as ordinary missions. Fetches flair in batches of 100; safe to re-run." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs(
+          "button",
+          {
+            className: "button",
+            onClick: handleReclassifyMissions,
+            style: { display: "flex", alignItems: "center", gap: "8px" },
+            children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsx(Download, { size: 16 }),
+              "Classify Missions by Flair"
+            ]
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { style: { marginBottom: "16px" }, children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "14px", marginBottom: "12px" }, children: "Collapse missions posted more than 30 days ago to tombstones. Reddit archives posts after ~30 days, so they can no longer be played. Each is reduced to its post id and date and all other metadata is dropped, but the record is kept so cleared history stays intact." }),
         /* @__PURE__ */ jsxRuntimeExports.jsxs(
           "button",
           {
@@ -1892,7 +1931,7 @@ const SettingsTab = () => {
             style: { display: "flex", alignItems: "center", gap: "8px" },
             children: [
               /* @__PURE__ */ jsxRuntimeExports.jsx(Trash2, { size: 16 }),
-              "Cleanup Archived Missions (30+ days)"
+              "Archive Old Missions (30+ days)"
             ]
           }
         )
@@ -1913,7 +1952,7 @@ const SettingsTab = () => {
         )
       ] }),
       /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { style: { marginBottom: "16px" }, children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "14px", marginBottom: "12px" }, children: "Remove 1–999 placeholder entries that never got real level flair (last 30 days). Tags them as not-missions so sync won't re-import trash. Run after sync if the dashboard is cluttered." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "14px", marginBottom: "12px" }, children: "Remove 1–999 placeholder entries that are still unflaired 24h after posting, and tag them as not-missions so sync won't re-import them. Daily Dungeons and devvit-enriched entries are never pruned. Run after sync if the dashboard is cluttered." }),
         /* @__PURE__ */ jsxRuntimeExports.jsxs(
           "button",
           {
@@ -10258,6 +10297,7 @@ const MissionsTab = () => {
     return saved !== null ? parseInt(saved) : 999;
   });
   const [targetEssences, setTargetEssences] = reactExports.useState([]);
+  const [includeDailyDungeon, setIncludeDailyDungeon] = reactExports.useState(false);
   const [essenceFiltersLoaded, setEssenceFiltersLoaded] = reactExports.useState(false);
   const [essenceDictionary, setEssenceDictionary] = reactExports.useState({});
   const [sortConfig, setSortConfig] = reactExports.useState(() => {
@@ -10390,11 +10430,14 @@ const MissionsTab = () => {
       chrome.storage.local.set({
         [STORAGE_KEYS.AUTOMATION_FILTERS]: {
           ...current,
-          targetEssences
+          targetEssences,
+          includeDailyDungeon
         }
       });
     });
-  }, [targetEssences, essenceFiltersLoaded]);
+    // The AUTOMATION_FILTERS storage listener above already recomputes the bot
+    // queue when this write lands, so no explicit refresh is needed here.
+  }, [targetEssences, includeDailyDungeon, essenceFiltersLoaded]);
   reactExports.useEffect(() => {
     localStorage.setItem("missionsTab.sortConfig", JSON.stringify(sortConfig));
   }, [sortConfig]);
@@ -10546,6 +10589,14 @@ const MissionsTab = () => {
     setMissions(missionArray);
     setClearedPostIds(progress.cleared);
     setDisabledPostIds(progress.disabled);
+    // Restore saved bot filters before marking them loaded, so the effect that
+    // persists them does not immediately write defaults back over storage.
+    const storedFilters = await new Promise((resolve) => {
+      chrome.storage.local.get([STORAGE_KEYS.AUTOMATION_FILTERS], (result) => {
+        resolve(result?.[STORAGE_KEYS.AUTOMATION_FILTERS] || {});
+      });
+    });
+    setIncludeDailyDungeon(storedFilters.includeDailyDungeon === true);
     setEssenceFiltersLoaded(true);
     await refreshBotQueue();
   };
@@ -11114,6 +11165,33 @@ Pending missions re-enter the bot queue after you refresh the queue.`)) {
             id
           ))
         ] }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs(
+          "label",
+          {
+            style: {
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              marginLeft: "8px",
+              fontSize: "13px",
+              color: "#a1a1aa",
+              cursor: "pointer"
+            },
+            title: "Daily Dungeons run in a separate game mode that the standard mission automation does not drive. Off by default.",
+            children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsx(
+                "input",
+                {
+                  type: "checkbox",
+                  checked: includeDailyDungeon,
+                  onChange: (e) => setIncludeDailyDungeon(e.target.checked),
+                  style: { cursor: "pointer" }
+                }
+              ),
+              "Bot plays Daily Dungeons"
+            ]
+          }
+        ),
         /* @__PURE__ */ jsxRuntimeExports.jsxs(
           "select",
           {
