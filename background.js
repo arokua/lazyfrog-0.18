@@ -1,5 +1,12 @@
+// Shared mission rules (flair parsing, classification, archival, queue gating).
+// Classic service worker, so importScripts is available and runs synchronously
+// before the bundle body below. Exposes globalThis.LazyFrogMissionCore.
+importScripts("/lib/missionCore.js");
+
 var background = (function() {
   "use strict";
+  const missionCore = globalThis.LazyFrogMissionCore;
+  const MissionKind = missionCore.MissionKind;
   function defineBackground(arg) {
     if (arg == null || typeof arg === "function") return { main: arg };
     return arg;
@@ -4012,6 +4019,115 @@ ${err.message}`);
     }
     return compacted;
   }
+  /**
+   * Collapse missions older than the Reddit archive window down to tombstones.
+   *
+   * Reddit archives posts after ~30 days, after which they can never be played,
+   * so their encounters, images and metadata are dead weight. The record itself
+   * is KEPT (id + posting date only) rather than deleted, which is what keeps
+   * cleared history in `userProgress` meaningful and stops sync re-adding the
+   * post later. This replaces the old delete-and-forget cleanup, which also
+   * stripped the matching progress entries.
+   *
+   * @returns {{archived:number, scanned:number, bytesFreed:number}}
+   */
+  async function archiveOldMissions(options = {}) {
+    const days = options.days ?? missionCore.ARCHIVE_AFTER_DAYS;
+    const now = Date.now();
+    const missions = await getAllMissions();
+    let archived = 0;
+    let bytesBefore = 0;
+    let bytesAfter = 0;
+    for (const [postId, mission] of Object.entries(missions)) {
+      if (!mission) continue;
+      if (missionCore.isTombstone(mission)) continue;
+      if (!missionCore.isMissionArchived(mission, now, days)) continue;
+      const tombstone = missionCore.buildArchivedTombstone(mission);
+      if (!tombstone) continue;
+      bytesBefore += JSON.stringify(mission).length;
+      bytesAfter += JSON.stringify(tombstone).length;
+      missions[postId] = tombstone;
+      archived++;
+    }
+    if (archived > 0) {
+      await new Promise((resolve, reject) => {
+        chrome.storage.local.set({ [STORAGE_KEYS.MISSIONS]: missions }, () => {
+          if (chrome.runtime.lastError) {
+            reject(chrome.runtime.lastError);
+            return;
+          }
+          resolve();
+        });
+      });
+      chrome.runtime.sendMessage({ type: "MISSIONS_UPDATED" }).catch(() => {
+      });
+    }
+    const result = {
+      archived,
+      scanned: Object.keys(missions).length,
+      bytesFreed: Math.max(0, bytesBefore - bytesAfter)
+    };
+    extensionLogger.log("[MissionArchive] Archived old missions to tombstones", { ...result, days });
+    return result;
+  }
+  /**
+   * One-off migration: give stored missions a flairText + missionKind.
+   *
+   * Records written before flair classification existed have neither, because
+   * the old ingest parsed flair for levels and discarded the text. Flair is
+   * re-fetched in batches of 100 via /api/info.json (the same endpoint the
+   * level backfill already uses).
+   *
+   * Archived tombstones and already-classified records are skipped, so this is
+   * cheap to re-run and safe to call more than once.
+   */
+  async function reclassifyStoredMissions(options = {}) {
+    const maxCount = options.maxCount ?? 5e3;
+    const missions = await getAllMissions();
+    const candidates = Object.values(missions)
+      .filter((m) => m?.postId && !missionCore.isTombstone(m) && !m.missionKind)
+      .sort((a, b) => (getMissionPostedMs(b) || 0) - (getMissionPostedMs(a) || 0))
+      .slice(0, maxCount);
+    if (!candidates.length) {
+      return { updated: 0, scanned: 0, byKind: {} };
+    }
+    const flairMap = await fetchFlairLevelsBatchFromRedditApi(candidates.map((m) => m.postId));
+    const merged = { ...missions };
+    const byKind = {};
+    let updated = 0;
+    let unresolved = 0;
+    for (const mission of candidates) {
+      const entry = getFlairEntryForPostId(flairMap, mission.postId);
+      if (!entry) {
+        // Post is deleted or no longer returned by the API. Leave it untouched
+        // rather than guessing a kind for it.
+        unresolved++;
+        continue;
+      }
+      const next = { ...mission };
+      applyFlairEntryToMission(next, entry);
+      if (!next.missionKind) continue;
+      merged[mission.postId] = next;
+      byKind[next.missionKind] = (byKind[next.missionKind] || 0) + 1;
+      updated++;
+    }
+    if (updated > 0) {
+      await new Promise((resolve, reject) => {
+        chrome.storage.local.set({ [STORAGE_KEYS.MISSIONS]: merged }, () => {
+          if (chrome.runtime.lastError) {
+            reject(chrome.runtime.lastError);
+            return;
+          }
+          resolve();
+        });
+      });
+      chrome.runtime.sendMessage({ type: "MISSIONS_UPDATED" }).catch(() => {
+      });
+    }
+    const result = { updated, scanned: candidates.length, unresolved, byKind };
+    extensionLogger.log("[MissionReclassify] Classified stored missions", result);
+    return result;
+  }
   async function setMissionDisabled(postId, disabled) {
     return setMissionDisabled$1(postId);
   }
@@ -4322,32 +4438,19 @@ ${err.message}`);
       });
     });
   }
-  function normalizeStarFilter(stars) {
-    if (!Array.isArray(stars)) return [];
-    return stars.map((s) => Number(s)).filter((s) => Number.isFinite(s) && s >= 1 && s <= 5);
-  }
-  function isAllStarsSelected(stars) {
-    const normalized = normalizeStarFilter(stars);
-    return normalized.length === 0 || normalized.length === 5 && [1, 2, 3, 4, 5].every((d) => normalized.includes(d));
-  }
-  function getMissionStarDifficulty(mission) {
-    const difficulty = Number(mission?.difficulty);
-    if (Number.isFinite(difficulty) && difficulty > 0) {
-      return Math.max(1, Math.min(5, Math.round(difficulty)));
-    }
-    const stars = Number(mission?.stars);
-    if (Number.isFinite(stars) && stars > 0) {
-      return Math.max(1, Math.min(5, Math.round(stars)));
-    }
-    return 0;
-  }
+  const normalizeStarFilter = missionCore.normalizeStarFilter;
+  const isAllStarsSelected = missionCore.isAllStarsSelected;
+  const getMissionStarDifficulty = missionCore.getMissionStarDifficulty;
   function normalizeAutomationFilters(filters) {
     const source = filters || {};
     return {
       stars: normalizeStarFilter(source.stars ?? [1, 2, 3, 4, 5]),
       minLevel: source.minLevel !== void 0 ? Number(source.minLevel) : 1,
       maxLevel: source.maxLevel !== void 0 ? Number(source.maxLevel) : 1200,
-      targetEssences: Array.isArray(source.targetEssences) ? source.targetEssences : []
+      targetEssences: Array.isArray(source.targetEssences) ? source.targetEssences : [],
+      // Daily Dungeons run in a separate game mode (its own Phaser scene) that the
+      // standard mission automation does not drive, so they are opt-in.
+      includeDailyDungeon: source.includeDailyDungeon === true
     };
   }
   function getMissionSortTime(mission) {
@@ -4358,6 +4461,13 @@ ${err.message}`);
     return 0;
   }
   const BOT_QUEUE_SNAPSHOT_KEY = "lazyfrogBotQueueSnapshot";
+  /** Read the user's saved bot filters from storage. */
+  async function getStoredAutomationFilters() {
+    const stored = await new Promise((resolve) => {
+      chrome.storage.local.get(["automationFilters"], resolve);
+    });
+    return stored?.automationFilters;
+  }
   async function buildBotQueueSnapshot(filters) {
     const normalizedFilters = normalizeAutomationFilters(filters);
     const queue = await getFilteredUnclearedMissions(normalizedFilters);
@@ -4422,19 +4532,7 @@ ${err.message}`);
   function getMissionSyncCutoffMs(asOfMs = Date.now()) {
     return asOfMs - MISSION_SYNC_DAYS * 24 * 60 * 60 * 1e3;
   }
-  function getMissionPostedMs(mission) {
-    if (!mission || typeof mission !== "object") return null;
-    if (typeof mission.postedAt === "number" && mission.postedAt > 0) {
-      return mission.postedAt;
-    }
-    if (typeof mission.createdUtc === "number" && mission.createdUtc > 0) {
-      return mission.createdUtc * 1e3;
-    }
-    if (typeof mission.timestamp === "number" && mission.timestamp > 0) {
-      return mission.timestamp;
-    }
-    return null;
-  }
+  const getMissionPostedMs = missionCore.getMissionPostedMs;
   function isMissionWithinMaxAge(mission, asOfMs = Date.now()) {
     const postedMs = getMissionPostedMs(mission);
     if (!postedMs) return true;
@@ -4452,6 +4550,16 @@ ${err.message}`);
     const allStarsSelected = isAllStarsSelected(starFilter);
     let unclearedMissions = Object.values(missions).filter((m) => {
       if (nonMissionSet.has(m.postId) || nonMissionSet.has(String(m.postId || "").replace(/^t3_/, ""))) {
+        return false;
+      }
+      // Archived records are reduced to id + date tombstones; they hold no
+      // playable data and the post can no longer be played on Reddit anyway.
+      if (missionCore.isTombstone(m)) {
+        return false;
+      }
+      // Cloak / unflaired posts are not missions; Daily Dungeons are a separate
+      // game mode and stay out of the queue unless explicitly opted in.
+      if (!missionCore.isMissionKindQueueable(m, normalizedFilters)) {
         return false;
       }
       if (progress.cleared.includes(m.postId) || progress.disabled.includes(m.postId)) {
@@ -4515,28 +4623,7 @@ ${err.message}`);
     const filteredMissions = filters?.excludePostIds ? unclearedMissions.filter((m) => !filters.excludePostIds.includes(m.postId)) : unclearedMissions;
     return filteredMissions.slice(0, Math.max(0, count || 0));
   }
-  function parseLevelRangeFromFlair(flairText) {
-    if (!flairText) return null;
-    const normalized = String(flairText).replace(/[\u2013\u2014–—]/g, "-").replace(/★/g, "").trim();
-    const patterns = [
-      /(?:levels?|level|lv\.?)\s*(\d+)\s*-\s*(\d+)/i,
-      /(\d+)\s*-\s*(\d+)\s*(?:levels?|level)/i,
-      /^(\d+)\s*-\s*(\d+)$/,
-      /(?:^|\s)(\d{1,4})\s*-\s*(\d{1,4})(?:\s|$)/
-    ];
-    for (const pattern of patterns) {
-      const match = normalized.match(pattern);
-      if (!match) continue;
-      const minLevel = Number.parseInt(match[1], 10);
-      const maxLevel = Number.parseInt(match[2], 10);
-      if (!Number.isFinite(minLevel) || !Number.isFinite(maxLevel) || minLevel > maxLevel) {
-        continue;
-      }
-      if (minLevel < 1 || maxLevel > MISSION_LEVEL_MAX) continue;
-      return { minLevel, maxLevel };
-    }
-    return null;
-  }
+  const parseLevelRangeFromFlair = missionCore.parseLevelRangeFromFlair;
   function normalizeRedditPostIdForApi(postId) {
     if (!postId || typeof postId !== "string") return null;
     return postId.startsWith("t3_") ? postId : `t3_${postId}`;
@@ -4574,13 +4661,23 @@ ${err.message}`);
           const post = child?.data;
           if (!post?.id) continue;
           const flairText = extractFlairTextFromPost(post);
-          const levels = parseLevelRangeFromFlair(flairText);
-          if (!levels) continue;
+          const createdUtc = post.created_utc || post.created || 0;
+          const classification = missionCore.classifyMission({
+            flairText,
+            title: post.title,
+            postedAt: createdUtc ? createdUtc * 1e3 : 0,
+            now: Date.now()
+          });
+          // Entries without a level range are kept deliberately: a Cloak or Daily
+          // Dungeon flair carries no levels, and dropping them here is what
+          // previously left those posts permanently unclassified.
           const fullId = `t3_${post.id}`;
           const entry = {
-            minLevel: levels.minLevel,
-            maxLevel: levels.maxLevel,
-            difficulty: parseDifficultyFromFlair(flairText)
+            flairText,
+            missionKind: classification.kind,
+            difficulty: classification.difficulty,
+            minLevel: classification.levels?.minLevel,
+            maxLevel: classification.levels?.maxLevel
           };
           flairByPostId.set(fullId, entry);
           flairByPostId.set(post.id, entry);
@@ -4597,20 +4694,47 @@ ${err.message}`);
     }
     return flairByPostId;
   }
+  /**
+   * Write freshly fetched flair onto a mission record.
+   * Returns true when something actually changed, so callers can count real work.
+   */
   function applyFlairEntryToMission(mission, flairEntry) {
     if (!mission || !flairEntry) return false;
-    mission.minLevel = flairEntry.minLevel;
-    mission.maxLevel = flairEntry.maxLevel;
-    mission.difficulty = Math.max(Number(mission.difficulty) || 0, Number(flairEntry.difficulty) || 0);
-    mission.needsFlairLevels = false;
-    return true;
+    let changed = false;
+    if (flairEntry.flairText !== void 0 && mission.flairText !== flairEntry.flairText) {
+      mission.flairText = flairEntry.flairText;
+      changed = true;
+    }
+    if (flairEntry.missionKind && mission.missionKind !== flairEntry.missionKind) {
+      mission.missionKind = flairEntry.missionKind;
+      changed = true;
+    }
+    const hasLevels = Number.isFinite(flairEntry.minLevel) && Number.isFinite(flairEntry.maxLevel);
+    if (hasLevels) {
+      if (mission.minLevel !== flairEntry.minLevel || mission.maxLevel !== flairEntry.maxLevel) {
+        mission.minLevel = flairEntry.minLevel;
+        mission.maxLevel = flairEntry.maxLevel;
+        changed = true;
+      }
+      mission.needsFlairLevels = false;
+    }
+    const difficulty = Math.max(Number(mission.difficulty) || 0, Number(flairEntry.difficulty) || 0);
+    if (difficulty !== mission.difficulty) {
+      mission.difficulty = difficulty;
+      changed = true;
+    }
+    return changed;
   }
   function getFlairEntryForPostId(flairMap, postId) {
     if (!flairMap || !postId) return null;
     return flairMap.get(postId) || flairMap.get(String(postId).replace(/^t3_/, "")) || flairMap.get(normalizeRedditPostIdForApi(postId)) || null;
   }
   async function backfillFlairOnMissionArray(missions) {
-    const needs = missions.filter((m) => m?.postId && (m.needsFlairLevels || isPlaceholderLevelRange(m)));
+    // Also pick up records predating flair classification, so existing storage
+    // gets a missionKind rather than only newly synced posts.
+    const needs = missions.filter(
+      (m) => m?.postId && (m.needsFlairLevels || isPlaceholderLevelRange(m) || !m.missionKind)
+    );
     if (!needs.length) {
       return { enriched: 0, scanned: 0 };
     }
@@ -4633,7 +4757,10 @@ ${err.message}`);
       if (nonMissionSet.has(m.postId) || nonMissionSet.has(String(m.postId).replace(/^t3_/, ""))) {
         return false;
       }
-      if (!isPlaceholderLevelRange(m)) return false;
+      if (missionCore.isTombstone(m)) return false;
+      // Records with no missionKind predate flair classification and need one,
+      // even if their level range is already known.
+      if (!isPlaceholderLevelRange(m) && m.missionKind) return false;
       const postedMs = getMissionPostedMs(m);
       if (postedMs && postedMs < cutoffMs) return false;
       return true;
@@ -4649,12 +4776,9 @@ ${err.message}`);
     for (const mission of candidates) {
       const entry = getFlairEntryForPostId(flairMap, mission.postId);
       if (!entry) continue;
-      mergedMissions[mission.postId] = {
-        ...mission,
-        minLevel: entry.minLevel,
-        maxLevel: entry.maxLevel,
-        difficulty: Math.max(Number(mission.difficulty) || 0, Number(entry.difficulty) || 0)
-      };
+      const next = { ...mission };
+      if (!applyFlairEntryToMission(next, entry)) continue;
+      mergedMissions[mission.postId] = next;
       updated++;
     }
     if (updated > 0) {
@@ -4672,35 +4796,15 @@ ${err.message}`);
     }
     return { updated, scanned: candidates.length };
   }
-  function extractFlairTextFromPost(post) {
-    if (!post || typeof post !== "object") return "";
-    if (post.link_flair_text) return post.link_flair_text;
-    const rich = post.link_flair_richtext;
-    if (Array.isArray(rich)) {
-      return rich.map((part) => part?.t || "").join("").trim();
-    }
-    return "";
-  }
-  function parseDifficultyFromFlair(flairText) {
-    if (!flairText || typeof flairText !== "string") return 0;
-    const filledStars = (flairText.match(/★/g) || []).length;
-    if (filledStars >= 1 && filledStars <= 5) return filledStars;
-    const wordMatch = flairText.match(/(\d)\s*stars?/i);
-    if (wordMatch) {
-      const value = Number.parseInt(wordMatch[1], 10);
-      if (value >= 1 && value <= 5) return value;
-    }
-    return 0;
-  }
+  const extractFlairTextFromPost = missionCore.extractFlairText;
+  const parseDifficultyFromFlair = missionCore.parseDifficultyFromFlair;
   function resolveMissionDifficulty(existing, incoming) {
     const existingDifficulty = Number(existing?.difficulty) || Number(existing?.stars) || 0;
     const incomingDifficulty = Number(incoming?.difficulty) || Number(incoming?.stars) || 0;
     if (existing?.devvitEnrichedAt && existingDifficulty > 0) return existingDifficulty;
     return Math.max(existingDifficulty, incomingDifficulty);
   }
-  function isPlaceholderLevelRange(mission) {
-    return mission?.minLevel === 1 && mission?.maxLevel === 999;
-  }
+  const isPlaceholderLevelRange = missionCore.isPlaceholderLevelRange;
   function mergeSyncedMissionRecord(existing, incoming) {
     if (!existing) return { ...incoming };
     const incomingHasRealLevels = !isPlaceholderLevelRange(incoming);
@@ -5408,36 +5512,61 @@ ${err.message}`);
     const lowered = title.toLowerCase();
     return lowered.includes("cleared") || lowered.includes("completed") || lowered.includes("[done]") || lowered.includes("solved") || title.includes("✓") || title.includes("✔");
   }
-  const NON_MISSION_TITLE_PATTERNS = [
-    /^the inn$/i,
-    /megathread/i,
-    /daily\s+thread/i,
-    /weekly\s+thread/i,
-    /mod\s+announcement/i,
-    /^(discussion|question|help|bug)\b/i
-  ];
   function isLikelyNonMissionRedditPost(post) {
     if (!post || typeof post !== "object") return true;
-    const title = String(post.title || "").trim();
-    if (!title) return true;
-    return NON_MISSION_TITLE_PATTERNS.some((pattern) => pattern.test(title));
+    return missionCore.isNonMissionTitle(post.title);
   }
+  /**
+   * Reddit listing post -> mission record, or null to skip the post.
+   *
+   * Classification is delegated to the shared core so that flair rules (Cloak is
+   * not a mission, Daily Dungeon is its own kind, unflaired posts get a grace
+   * window before being written off) are identical everywhere. The flair text
+   * and resolved kind are persisted on the record -- previously the flair was
+   * parsed for levels and then thrown away, which made those rules impossible
+   * to apply downstream.
+   *
+   * `options.skipReason` receives why a post was rejected, for sync stats.
+   */
   function mapRedditPostToMission(child, options = {}) {
     const post = child?.data;
     if (!post?.id || !post?.permalink) return null;
     if (post.stickied || post.pinned) return null;
-    if (isLikelyNonMissionRedditPost(post)) return null;
-    const flairText = extractFlairTextFromPost(post);
-    const parsedLevels = parseLevelRangeFromFlair(flairText);
-    const allowPlaceholders = options.allowPlaceholders === true;
-    if (!parsedLevels && !allowPlaceholders) {
-      return null;
-    }
-    const levelRange = parsedLevels || { minLevel: 1, maxLevel: 999 };
     const createdUtc = post.created_utc || post.created || 0;
     const postedAt = createdUtc ? createdUtc * 1e3 : Date.now();
+    const flairText = extractFlairTextFromPost(post);
+    const classification = missionCore.classifyMission({
+      flairText,
+      title: post.title,
+      postedAt,
+      now: Date.now()
+    });
+    if (classification.kind === MissionKind.NOT_MISSION) {
+      if (options.skipReason) options.skipReason.value = classification.reason;
+      return null;
+    }
+    const allowPlaceholders = options.allowPlaceholders === true;
+    const parsedLevels = classification.levels;
+    // Unflaired and still inside the grace window: keep only when the caller is
+    // willing to hold a placeholder open for a later flair backfill.
+    if (classification.kind === MissionKind.UNKNOWN && !allowPlaceholders) {
+      if (options.skipReason) options.skipReason.value = classification.reason;
+      return null;
+    }
+    // A Daily Dungeon has no level flair by design, so it must never be gated on
+    // one the way a standard mission is.
+    if (!parsedLevels && !allowPlaceholders && classification.kind !== MissionKind.DAILY_DUNGEON) {
+      if (options.skipReason) options.skipReason.value = "noLevelFlair";
+      return null;
+    }
+    const levelRange = parsedLevels || {
+      minLevel: missionCore.PLACEHOLDER_MIN_LEVEL,
+      maxLevel: missionCore.PLACEHOLDER_MAX_LEVEL
+    };
     return {
       postId: `t3_${post.id}`,
+      flairText,
+      missionKind: classification.kind,
       timestamp: postedAt,
       postedAt,
       createdUtc: createdUtc || void 0,
@@ -5469,14 +5598,21 @@ ${err.message}`);
       if (createdMs && createdMs < cutoffMs) continue;
       if (untilMs && createdMs && createdMs > untilMs) continue;
       stats.postsScanned++;
-      const mission = mapRedditPostToMission(child, options);
+      const skipReason = { value: null };
+      const mission = mapRedditPostToMission(child, { ...options, skipReason });
       if (!mission) {
-        const flairText = extractFlairTextFromPost(child?.data);
-        if (!parseLevelRangeFromFlair(flairText)) {
+        // Break the skip count out by cause so a sync that silently drops
+        // everything is visible in the summary rather than guessed at.
+        const reason = skipReason.value || "other";
+        stats.skippedByReason = stats.skippedByReason || {};
+        stats.skippedByReason[reason] = (stats.skippedByReason[reason] || 0) + 1;
+        if (reason === "noLevelFlair" || reason === "awaitingFlair" || reason === "noFlairPastGrace") {
           stats.postsSkippedNoFlair = (stats.postsSkippedNoFlair || 0) + 1;
         }
         continue;
       }
+      stats.byKind = stats.byKind || {};
+      stats.byKind[mission.missionKind] = (stats.byKind[mission.missionKind] || 0) + 1;
       if (mission.needsFlairLevels) {
         stats.postsWithoutFlair++;
       } else {
@@ -5646,12 +5782,22 @@ ${err.message}`);
     const cutoffMs = Date.now() - daysBack * 24 * 60 * 60 * 1e3;
     const allMissions = await getAllMissions();
     const toRemove = [];
+    const now = Date.now();
     for (const [postId, mission] of Object.entries(allMissions)) {
       if (!mission) continue;
+      if (missionCore.isTombstone(mission)) continue;
+      // Never prune a real mission or a Daily Dungeon. A Daily Dungeon carries no
+      // level flair by design, so it always looks like a placeholder here -- the
+      // kind check is what stops it being deleted and permanently blacklisted.
+      const kind = missionCore.getMissionKind(mission);
+      if (kind !== MissionKind.NOT_MISSION && kind !== MissionKind.UNKNOWN) continue;
       if (!isPlaceholderLevelRange(mission)) continue;
       if (mission.devvitEnrichedAt) continue;
       const postedMs = getMissionPostedMs(mission);
-      if (postedMs && postedMs < cutoffMs) continue;
+      // Only prune once the post has had its full grace window to acquire a flair.
+      // Previously this comparison was inverted -- it kept stale placeholders and
+      // deleted fresh ones, destroying posts that were merely awaiting flair.
+      if (postedMs && now - postedMs < missionCore.FLAIR_GRACE_MS) continue;
       const full = normalizeNonMissionPostId(postId);
       if (full) {
         toRemove.push(full);
@@ -5814,6 +5960,7 @@ ${err.message}`);
       maxCount: 800
     });
     const prunedJunk = await pruneUnflairedJunkMissionsFromStorage({ daysBack, tagAsNonMission: true });
+    const archivedOld = await archiveOldMissions();
     const enrichment = runEnrichment ? await runMissionMetadataEnrichment({
       postIds: persistResult.newlyAddedPostIds,
       maxCount: Math.min(persistResult.newlyAddedPostIds.length, 100),
@@ -5838,6 +5985,7 @@ ${err.message}`);
       fetchedFlairBackfill,
       storageFlairBackfill,
       prunedJunk,
+      archivedOld,
       subredditTabsScanned: tabsScanned,
       enrichment
     });
@@ -5859,6 +6007,7 @@ ${err.message}`);
       fetchedFlairBackfill,
       storageFlairBackfill,
       prunedJunk,
+      archivedOld,
       subredditTabsScanned: tabsScanned,
       enrichment
     };
@@ -8559,10 +8708,7 @@ ${err.message}`);
         case "REFRESH_BOT_QUEUE":
           {
             try {
-              const stored = await new Promise((resolve) => {
-                chrome.storage.local.get(["automationFilters"], resolve);
-              });
-              const snapshot = await buildBotQueueSnapshot(stored.automationFilters);
+              const snapshot = await buildBotQueueSnapshot(await getStoredAutomationFilters());
               sendResponse({ success: true, snapshot });
             } catch (error) {
               extensionLogger.error("[REFRESH_BOT_QUEUE] Failed", { error: String(error) });
@@ -8658,6 +8804,30 @@ ${err.message}`);
               sendResponse({ success: true, enrichment });
             } catch (error) {
               extensionLogger.error("[ENRICH_MISSION_METADATA] Failed", { error: String(error) });
+              sendResponse({ success: false, error: String(error) });
+            }
+          }
+          return true;
+        case "ARCHIVE_OLD_MISSIONS":
+          {
+            try {
+              const result = await archiveOldMissions({ days: message.days });
+              await buildBotQueueSnapshot(await getStoredAutomationFilters());
+              sendResponse({ success: true, ...result });
+            } catch (error) {
+              extensionLogger.error("[ARCHIVE_OLD_MISSIONS] Failed", { error: String(error) });
+              sendResponse({ success: false, error: String(error) });
+            }
+          }
+          return true;
+        case "RECLASSIFY_MISSIONS":
+          {
+            try {
+              const result = await reclassifyStoredMissions({ maxCount: message.maxCount });
+              await buildBotQueueSnapshot(await getStoredAutomationFilters());
+              sendResponse({ success: true, ...result });
+            } catch (error) {
+              extensionLogger.error("[RECLASSIFY_MISSIONS] Failed", { error: String(error) });
               sendResponse({ success: false, error: String(error) });
             }
           }

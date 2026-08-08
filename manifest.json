@@ -53,12 +53,12 @@
       "matches": ["https://*.devvit.net/*"],
       "all_frames": true,
       "run_at": "document_start",
-      "js": ["content-scripts/devvit.js", "content-scripts/autosell.js"]
+      "js": ["lib/missionCore.js", "content-scripts/devvit.js", "content-scripts/autosell.js"]
     },
     {
       "matches": ["https://www.reddit.com/*"],
       "run_at": "document_start",
-      "js": ["content-scripts/reddit.js"]
+      "js": ["lib/missionCore.js", "content-scripts/reddit.js"]
     }
   ]
 }
