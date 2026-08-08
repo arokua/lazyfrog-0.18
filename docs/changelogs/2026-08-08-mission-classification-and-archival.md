@@ -53,8 +53,10 @@
 
 - `getFilteredUnclearedMissions` in all three copies (background, reddit,
   missions chunk) now applies the same kind and tombstone gating.
-- Eight duplicated helpers removed from `background.js` and four from
-  `content-scripts/reddit.js` in favour of the shared core.
+- Fourteen duplicated helpers removed in favour of the shared core: eight from
+  `background.js`, four from `content-scripts/reddit.js`, two from
+  `chunks/options-*.js`. Level-range parsing and star-difficulty parsing now
+  have exactly one implementation each.
 
 ## Known gaps
 
@@ -67,6 +69,10 @@
   (340 / 1200 / 340). Not touched in this pass.
 - `chunks/missions-*.js` and `background.js` still hold separate
   `/api/info.json` batch fetchers.
+- `getFilteredUnclearedMissions` still exists three times. All three now apply
+  identical kind/tombstone gating via the shared core, but the surrounding
+  storage reads and level-matching remain separate implementations — and they
+  disagree: background uses range *overlap*, the source tree used *containment*.
 
 ## Files modified
 

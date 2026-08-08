@@ -1,5 +1,8 @@
 const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["chunks/exportAllData-DY-7Djam.js","chunks/missions-D8fOGyOo.js"])))=>i.map(i=>d[i]);
 import { c as createLucideIcon, r as reactExports, j as jsxRuntimeExports, _ as __vitePreload, B as Bug, S as Settings, a as requireReactDom, b as requireReact, C as ChevronRight, d as ChevronDown, V as VERSION, g as getMission, s as saveMissionsBatch, e as STORAGE_KEYS, f as getAllMissions, i as importMissions, h as getAllUserProgress, k as ChartColumn, l as Star, P as Play, m as clientExports, v as getEssenceLootDictionary, w as setEssenceLootDictionary, y as parseEssenceLootDictionaryImport, x as missionMatchesEssenceFilter, E as DEFAULT_ESSENCE_LOOT_DICTIONARY, A as countFoodsForEssence, F as getEssenceFilterOptions, H as parseFoodNameLines, I as getAutomationFilters, J as getFilteredUnclearedMissions, K as getBotQueueSnapshot, N as missionLevelRangeOverlapsFilter, O as MISSION_QUEUE_MAX_AGE_DAYS, Q as deleteMissions, Y as setMissionsClearedStatus } from "./missions-D8fOGyOo.js";
+// Shared mission rules. options.html loads lib/missionCore.js as a classic
+// script before this module, so the global is already populated here.
+const missionCore = globalThis.LazyFrogMissionCore;
 var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
 function getDefaultExportFromCjs(x) {
   return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
@@ -9205,36 +9208,11 @@ function extractPostId(url) {
     return null;
   }
 }
-function parseLevelsFromFlair(linkFlairText) {
-  if (!linkFlairText) return null;
-  const normalized = String(linkFlairText).replace(/[\u2013\u2014–—]/g, "-").trim();
-  const patterns = [
-    /(?:levels?|level|lv\.?)\s*(\d+)\s*-\s*(\d+)/i,
-    /(\d+)\s*-\s*(\d+)\s*(?:levels?|level)/i
-  ];
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-    if (!match) continue;
-    const minLevel = parseInt(match[1], 10);
-    const maxLevel = parseInt(match[2], 10);
-    if (!Number.isFinite(minLevel) || !Number.isFinite(maxLevel) || minLevel > maxLevel) {
-      continue;
-    }
-    return { minLevel, maxLevel };
-  }
-  return null;
-}
-function parseDifficultyFromFlairText(linkFlairText) {
-  if (!linkFlairText) return 0;
-  const filledStars = (linkFlairText.match(/★/g) || []).length;
-  if (filledStars >= 1 && filledStars <= 5) return filledStars;
-  const wordMatch = linkFlairText.match(/(\d)\s*stars?/i);
-  if (wordMatch) {
-    const value = parseInt(wordMatch[1], 10);
-    if (value >= 1 && value <= 5) return value;
-  }
-  return 0;
-}
+// Delegated to the shared core (lib/missionCore.js), loaded by options.html.
+// This copy had only two of the four level patterns and never stripped star
+// glyphs, so a flair like "★★★ Level 21-40" parsed here but not elsewhere.
+const parseLevelsFromFlair = missionCore.parseLevelRangeFromFlair;
+const parseDifficultyFromFlairText = missionCore.parseDifficultyFromFlair;
 
 function buildMissionFromUrlImport(postId, options, metadata) {
   return {
