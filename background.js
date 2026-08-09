@@ -3046,6 +3046,94 @@ ${err.message}`);
   const DEFAULT_MAX_STORED_LOGS = 5e3;
   const BATCH_WRITE_INTERVAL = 1e4;
   const BATCH_SIZE_THRESHOLD = 50;
+  // Remote-log transport. Every context funnels through this one queue: content
+  // scripts relay here over REMOTE_LOG rather than POSTing themselves, because a
+  // page frame cannot be relied on to reach http://localhost (the game runs in a
+  // cross-origin devvit.net iframe whose direct fetches never arrived).
+  //
+  // This replaces a flat "at most one POST every 2s" throttle. That throttle
+  // fired whether or not the server was healthy, so a live server received
+  // roughly one entry every two seconds and silently lost the rest -- which is
+  // exactly the wrong behaviour for the case the log server exists to serve.
+  // Backpressure now comes from a bounded queue, and backoff only from real
+  // failures.
+  const REMOTE_LOG_QUEUE_LIMIT = 2e3;
+  const REMOTE_LOG_FAILURE_LIMIT = 3;
+  const REMOTE_LOG_BACKOFF_MS = 5 * 60 * 1e3;
+  const remoteLogQueue = [];
+  let remoteLogDraining = false;
+  let remoteLogDisabledUntil = 0;
+  let remoteLogFailures = 0;
+  function serializeRemoteLogEntry(entry) {
+    try {
+      return JSON.stringify(entry);
+    } catch {
+      return JSON.stringify({
+        ts: Date.now(),
+        level: entry?.level || "log",
+        source: entry?.source || entry?.context || "SW",
+        message: String(entry?.message || "log entry not serializable"),
+        data: { note: "original log data omitted (not JSON-serializable)" }
+      });
+    }
+  }
+  function disableRemoteLoggingInStorage() {
+    if (typeof chrome === "undefined" || !chrome.storage) return;
+    chrome.storage.local.get(["automationConfig"], (result2) => {
+      const cfg = result2.automationConfig || {};
+      if (cfg.remoteLogging) {
+        chrome.storage.local.set({
+          automationConfig: { ...cfg, remoteLogging: false }
+        });
+      }
+    });
+  }
+  function enqueueRemoteLogEntry(entry, remoteUrl) {
+    if (!remoteUrl) return;
+    if (remoteLogDisabledUntil && Date.now() < remoteLogDisabledUntil) return;
+    if (remoteLogQueue.length >= REMOTE_LOG_QUEUE_LIMIT) {
+      // Drop the oldest rather than the newest: during a burst the tail is what
+      // explains whatever just went wrong, and an unbounded queue in a service
+      // worker is a leak that outlives the burst.
+      remoteLogQueue.shift();
+    }
+    remoteLogQueue.push({ url: remoteUrl, body: serializeRemoteLogEntry(entry) });
+    void drainRemoteLogQueue();
+  }
+  async function drainRemoteLogQueue() {
+    if (remoteLogDraining) return;
+    remoteLogDraining = true;
+    try {
+      while (remoteLogQueue.length) {
+        if (remoteLogDisabledUntil && Date.now() < remoteLogDisabledUntil) {
+          remoteLogQueue.length = 0;
+          return;
+        }
+        const next = remoteLogQueue.shift();
+        try {
+          const response = await fetch(next.url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: next.body
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          remoteLogFailures = 0;
+        } catch {
+          remoteLogFailures += 1;
+          if (remoteLogFailures >= REMOTE_LOG_FAILURE_LIMIT) {
+            remoteLogDisabledUntil = Date.now() + REMOTE_LOG_BACKOFF_MS;
+            remoteLogQueue.length = 0;
+            disableRemoteLoggingInStorage();
+            return;
+          }
+        }
+      }
+    } finally {
+      remoteLogDraining = false;
+    }
+  }
   const _Logger = class _Logger {
     constructor(context, config, parentContext) {
       this.parentContext = parentContext;
@@ -3092,61 +3180,12 @@ ${err.message}`);
       }
     }
     /**
-     * Send log to remote server
+     * Queue the entry for the shared remote-log transport above, which owns
+     * ordering, backpressure and failure backoff for every context at once.
      */
     async sendToRemote(entry) {
       if (!this.config.remoteLogging) return;
-      try {
-        const now = Date.now();
-        if (_Logger.remoteLoggingDisabledUntil && now < _Logger.remoteLoggingDisabledUntil) return;
-        const currentUrl = this.config.remoteUrl;
-        if (_Logger.lastRemoteUrl !== currentUrl) {
-          _Logger.remoteFailures = 0;
-          _Logger.remoteLoggingDisabledUntil = 0;
-          _Logger.lastRemoteUrl = currentUrl;
-        }
-        if (_Logger.lastRemoteAttempt && now - _Logger.lastRemoteAttempt < 2e3) return;
-        _Logger.lastRemoteAttempt = now;
-        let body;
-        try {
-          body = JSON.stringify(entry);
-        } catch {
-          body = JSON.stringify({
-            ts: Date.now(),
-            level: entry?.level || "log",
-            source: entry?.source || this.config.context,
-            message: String(entry?.message || "log entry not serializable"),
-            data: { note: "original log data omitted (not JSON-serializable)" }
-          });
-        }
-        const response = await fetch(currentUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body
-        });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        _Logger.remoteFailures = 0;
-      } catch (error) {
-        _Logger.remoteFailures = (_Logger.remoteFailures || 0) + 1;
-        if (_Logger.remoteFailures >= 3) {
-          _Logger.remoteLoggingDisabledUntil = Date.now() + 5 * 60 * 1e3;
-          this.config.remoteLogging = false;
-          if (typeof chrome !== "undefined" && chrome.storage) {
-            chrome.storage.local.get(["automationConfig"], (result2) => {
-              const cfg = result2.automationConfig || {};
-              if (cfg.remoteLogging) {
-                chrome.storage.local.set({
-                  automationConfig: { ...cfg, remoteLogging: false }
-                });
-              }
-            });
-          }
-        }
-      }
+      enqueueRemoteLogEntry(entry, this.config.remoteUrl);
     }
     /**
      * Flush buffered logs to chrome.storage
@@ -3239,16 +3278,19 @@ ${err.message}`);
         }
         return String(arg);
       }).join(" ");
+      const fullContext = this.parentContext ? `${this.parentContext}][${this.config.context}` : this.config.context;
       const entry = {
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         context: this.config.context,
+        // log-server.js reads `source` (never `context`), so without this every
+        // entry lands in the unattributed bucket and by-source/ is useless.
+        source: fullContext,
         level,
         message,
         data: args.length > 1 ? this.serializeData(args.slice(1)) : void 0
       };
       if (this.config.consoleLogging) {
         const consoleMethod = console[level] || console.log;
-        const fullContext = this.parentContext ? `${this.parentContext}][${this.config.context}` : this.config.context;
         consoleMethod(`[LF][${fullContext}]`, ...args);
       }
       this.storeLog(entry);
@@ -8117,6 +8159,12 @@ ${err.message}`);
           sendResponse({ success: true });
           break;
         // Events from content scripts → state machine
+        case "REMOTE_LOG":
+          // A content script's log line. Only extension contexts can reach this
+          // listener (no externally_connectable), so the payload is ours.
+          enqueueRemoteLogEntry(message.entry, message.remoteUrl);
+          sendResponse({ ok: true });
+          break;
         case "GET_CURRENT_MISSION_ID":
           {
             const snap = getStateMachineSnapshot();

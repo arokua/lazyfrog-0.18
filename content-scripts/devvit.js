@@ -391,36 +391,31 @@ var devvit = (function() {
       }
     }
     /**
-     * Send log to remote server
+     * Hand the entry to the service worker, which owns the actual POST.
+     *
+     * A content script must not fetch the log server itself. This one runs in an
+     * https://*.devvit.net iframe, and a cross-origin request from there to
+     * http://localhost silently never arrived -- every DEVVIT and DEVVIT-GIAE
+     * line was lost, while byte-identical Logger code in the service worker
+     * logged fine all session. The worker holds the localhost host permission
+     * and has no page CSP or private-network preflight to satisfy, so it is the
+     * only context that can be relied on to reach the server. It also owns the
+     * retry circuit breaker, so a dead server is backed off once rather than
+     * once per frame.
      */
     async sendToRemote(entry) {
       if (!this.config.remoteLogging) return;
       try {
-        const now = Date.now();
-        if (_Logger.remoteLoggingDisabledUntil && now < _Logger.remoteLoggingDisabledUntil) return;
-        const currentUrl = this.config.remoteUrl;
-        if (_Logger.lastRemoteUrl !== currentUrl) {
-          _Logger.remoteFailures = 0;
-          _Logger.remoteLoggingDisabledUntil = 0;
-          _Logger.lastRemoteUrl = currentUrl;
-        }
-        const response = await fetch(currentUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(entry)
-        });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        _Logger.remoteFailures = 0;
-      } catch (error) {
-        _Logger.remoteFailures = (_Logger.remoteFailures || 0) + 1;
-        // If the local log server isn't running, stop retrying for a while.
-        if (_Logger.remoteFailures >= 3) {
-          _Logger.remoteLoggingDisabledUntil = Date.now() + 5 * 60 * 1e3;
-        }
+        chrome.runtime.sendMessage(
+          { type: "REMOTE_LOG", entry, remoteUrl: this.config.remoteUrl },
+          () => {
+            // Touch lastError so a sleeping worker does not print "Unchecked
+            // runtime.lastError". Never log from in here -- it would recurse.
+            void chrome.runtime.lastError;
+          }
+        );
+      } catch {
+        // Extension context torn down by a reload/update. Nothing to do.
       }
     }
     static disableStorage() {
@@ -542,6 +537,9 @@ var devvit = (function() {
       const entry = {
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         context: this.config.context,
+        // log-server.js reads `source` (never `context`), so without this every
+        // entry lands in the unattributed bucket and by-source/ is useless.
+        source: fullContext,
         level,
         message: loggedMessage,
         data: args.length > 1 ? this.serializeData(args.slice(1)) : void 0

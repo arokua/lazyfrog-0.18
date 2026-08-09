@@ -320,38 +320,31 @@ var reddit = (function() {
     /**
      * Send log to remote server
      */
+    /**
+     * Hand the entry to the service worker, which owns the actual POST. See the
+     * matching note in content-scripts/devvit.js for why a content script must
+     * not reach the log server directly.
+     *
+     * This also drops a 2s global attempt throttle that used to guard against
+     * hammering a dead server. It cost far more than it saved: it was keyed on a
+     * static shared by every Logger in the page, so during a busy mission it
+     * discarded all but one entry every two seconds. Backing off a dead server
+     * is now the worker's job, and it does it without losing entries when the
+     * server is alive.
+     */
     async sendToRemote(entry) {
       if (!this.config.remoteLogging) return;
       try {
-        const now = Date.now();
-        if (_Logger.remoteLoggingDisabledUntil && now < _Logger.remoteLoggingDisabledUntil) return;
-        const currentUrl = this.config.remoteUrl;
-        if (_Logger.lastRemoteUrl !== currentUrl) {
-          _Logger.remoteFailures = 0;
-          _Logger.remoteLoggingDisabledUntil = 0;
-          _Logger.lastRemoteUrl = currentUrl;
-        }
-        // Throttle attempts to avoid tight retry loops when the server is down.
-        if (_Logger.lastRemoteAttempt && now - _Logger.lastRemoteAttempt < 2000) return;
-        _Logger.lastRemoteAttempt = now;
-
-        const response = await fetch(currentUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(entry)
-        });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        _Logger.remoteFailures = 0;
-      } catch (error) {
-        _Logger.remoteFailures = (_Logger.remoteFailures || 0) + 1;
-        // If the local log server isn't running, stop retrying for a while.
-        if (_Logger.remoteFailures >= 3) {
-          _Logger.remoteLoggingDisabledUntil = Date.now() + 5 * 60 * 1e3;
-        }
+        chrome.runtime.sendMessage(
+          { type: "REMOTE_LOG", entry, remoteUrl: this.config.remoteUrl },
+          () => {
+            // Touch lastError so a sleeping worker does not print "Unchecked
+            // runtime.lastError". Never log from in here -- it would recurse.
+            void chrome.runtime.lastError;
+          }
+        );
+      } catch {
+        // Extension context torn down by a reload/update. Nothing to do.
       }
     }
     /**
@@ -476,6 +469,9 @@ var reddit = (function() {
       const entry = {
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         context: this.config.context,
+        // log-server.js reads `source` (never `context`), so without this every
+        // entry lands in the unattributed bucket and by-source/ is useless.
+        source: fullContext,
         level,
         message: loggedMessage,
         data: args.length > 1 ? this.serializeData(args.slice(1)) : void 0
