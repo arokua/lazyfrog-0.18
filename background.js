@@ -3061,13 +3061,26 @@ ${err.message}`);
   const REMOTE_LOG_POST_BATCH = 100;
   const REMOTE_LOG_FAILURE_LIMIT = 3;
   const REMOTE_LOG_BACKOFF_MS = 5 * 60 * 1e3;
+  // A drain must always finish. While entries arrive faster than they are
+  // POSTed the loop below never reaches an empty queue, which leaves an await
+  // pending inside a message handler indefinitely -- and a service worker whose
+  // handler never returns gets force-terminated, taking the state machine and
+  // the whole run with it. Hand control back after this many batches and let
+  // the next enqueue (or the resume timer) continue.
+  const REMOTE_LOG_MAX_BATCHES_PER_DRAIN = 10;
+  const REMOTE_LOG_RESUME_MS = 50;
   const remoteLogQueue = [];
   let remoteLogDraining = false;
   let remoteLogDisabledUntil = 0;
   let remoteLogFailures = 0;
   function serializeRemoteLogEntry(entry) {
     try {
-      return JSON.stringify(entry);
+      const json = JSON.stringify(entry);
+      // JSON.stringify returns undefined (not a string) for undefined and for
+      // functions. Splicing that into the batch array would emit invalid JSON
+      // and the server would reject the whole batch, not just the bad entry.
+      if (typeof json !== "string") throw new Error("not serializable");
+      return json;
     } catch {
       return JSON.stringify({
         ts: Date.now(),
@@ -3105,11 +3118,21 @@ ${err.message}`);
     if (remoteLogDraining) return;
     remoteLogDraining = true;
     try {
+      let batches = 0;
       while (remoteLogQueue.length) {
         if (remoteLogDisabledUntil && Date.now() < remoteLogDisabledUntil) {
           remoteLogQueue.length = 0;
           return;
         }
+        if (batches >= REMOTE_LOG_MAX_BATCHES_PER_DRAIN) {
+          // Yield. Anything still queued is picked up by the resume timer, so
+          // this handler returns instead of running until Chrome kills it.
+          setTimeout(() => {
+            void drainRemoteLogQueue();
+          }, REMOTE_LOG_RESUME_MS);
+          return;
+        }
+        batches += 1;
         // Drain as an array in one POST. Each entry was serialized on the way
         // in, so one unserializable entry cannot poison the batch, and /log
         // accepts either a single object or an array.
