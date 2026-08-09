@@ -6769,7 +6769,7 @@ ${err.message}`);
      * bot joined mid-flight, say) is skipped rather than written as zeroes,
      * which would look like a real zero-enemy mission in the regression.
      */
-    async function recordMissionTelemetry({ snapshot, completionSource }) {
+    async function recordMissionTelemetry({ snapshot, completionSource, outcome = "cleared" }) {
       const telemetry = globalThis.LazyFrogMissionTelemetry;
       if (!telemetry || !snapshot) return;
       try {
@@ -6777,7 +6777,7 @@ ${err.message}`);
         const row = telemetry.buildTelemetryRow({
           snapshot: { ...snapshot, navigationStartedMs: telemetryNavStartedMs },
           completedAtMs: Date.now(),
-          outcome: "cleared",
+          outcome,
           completionSource,
           config: stored.automationConfig || {},
           extensionVersion: chrome.runtime.getManifest()?.version || ""
@@ -6787,6 +6787,7 @@ ${err.message}`);
         await chrome.storage.local.set({ [telemetry.TELEMETRY_STORAGE_KEY]: rows });
         extensionLogger.log("[Telemetry] Mission row recorded", {
           postId: row.postId,
+          outcome: row.outcome,
           enemyCount: row.enemyCount,
           playMs: row.playMs,
           wallMs: row.wallMs,
@@ -8690,6 +8691,16 @@ ${err.message}`);
               errorMessage,
               currentState: errorSnapshot?.value
             });
+            // Only run-ending failures carry telemetry (see the out-of-lives
+            // branch in devvit.js). Other ERROR_OCCURRED senders are reporting
+            // extension faults, not mission outcomes, and must not become rows.
+            if (message.telemetryOutcome && message.telemetrySnapshot) {
+              recordMissionTelemetry({
+                snapshot: message.telemetrySnapshot,
+                completionSource: message.telemetrySource || "error",
+                outcome: message.telemetryOutcome
+              });
+            }
             sendToStateMachine({
               type: "ERROR_OCCURRED",
               message: errorMessage

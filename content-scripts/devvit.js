@@ -1386,7 +1386,14 @@ var devvit = (function() {
           this.stop();
           safeSendMessage({
             type: "ERROR_OCCURRED",
-            message: "Out of lives"
+            message: "Out of lives",
+            // The mission ends here as surely as it does on a victory screen, so
+            // it earns a telemetry row. Without one the CSV holds wins only, and
+            // any build compared on clear time is being judged on its surviving
+            // runs alone.
+            telemetryOutcome: "failed",
+            telemetrySnapshot: this.telemetrySnapshot,
+            telemetrySource: `out-of-lives-${screen}`
           });
           return;
         }
