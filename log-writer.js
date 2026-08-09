@@ -168,7 +168,13 @@ class LogWriter {
         "## Start logging",
         "",
         "1. `node log-server.js`",
-        "2. Enable remote logging in LazyFrog options, or run `lazyfrog.enableFetchDebug()` in a Reddit tab console.",
+        "2. Enable remote logging in LazyFrog options.",
+        "   For request/response bodies, also set `debugFetch` (no UI toggle yet) from",
+        "   the service worker console at chrome://extensions:",
+        "   ```js",
+        "   chrome.storage.local.get(['automationConfig'], r =>",
+        "     chrome.storage.local.set({ automationConfig: { ...(r.automationConfig || {}), debugFetch: true } }))",
+        "   ```",
         "3. Import chrome.storage export: `node scripts/import-chrome-logs.js path/to/export.json`",
         ""
       ].join("\n")

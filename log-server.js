@@ -11,7 +11,10 @@
  *   automationConfig.remoteLogging = true
  *   automationConfig.remoteUrl     = "http://localhost:7856/log"
  *
- * Or in a Reddit tab console: lazyfrog.enableFetchDebug()
+ * For request/response bodies, also set automationConfig.debugFetch = true.
+ * There is no UI toggle; from the service worker console at chrome://extensions:
+ *   chrome.storage.local.get(['automationConfig'], r =>
+ *     chrome.storage.local.set({ automationConfig: { ...(r.automationConfig || {}), debugFetch: true } }))
  *
  * Import chrome.storage export:
  *   node scripts/import-chrome-logs.js path/to/lazyfrog-logs-export.json
