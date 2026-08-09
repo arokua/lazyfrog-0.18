@@ -116,8 +116,8 @@ error (can transition from any state)
 | `MISSION_COMPLETED` | Devvit Content | Background | Finish button clicked |
 | `MISSION_FOUND` | Reddit Content | Background | Found mission matching filters |
 | `NO_MISSIONS_FOUND` | Reddit Content | Background | No missions match filters |
-| `GAME_DIALOG_CLOSED` | Background | Background | Dialog confirmed gone; proceed to `navigating` |
-| `DIALOG_CLOSE_TIMEOUT` | Background | Background | Dialog would not close after ~20s; navigate anyway |
+| `GAME_DIALOG_CLOSED` | Background | Background | Settle elapsed after victory; proceed to `navigating` |
+| `DIALOG_CLOSE_TIMEOUT` | Background | Background | Vestigial escape hatch; nothing fires it now that the settle is unconditional |
 | `ERROR_OCCURRED` | Any Content | Background | Something went wrong |
 | `RETRY` | User/Popup | Background | Retry after error |
 | `NAVIGATE_TO_MISSION` | Background | Background | Internal event to navigate |
@@ -394,15 +394,22 @@ console.log(JSON.stringify(toJSON(botMachine), null, 2));
 ## Troubleshooting
 
 ### Bot gets stuck in waitingForDialogClose at mission end
+> [!NOTE]
+> Historical. `waitingForDialogClose` no longer closes or polls the dialog, so
+> this class of hang is gone. Kept because old logs still show it.
+
 - **Symptom**: `presentationState` sits on `waitingForDialogClose`, the game
   iframe still shows the victory screen, and the queue never advances even
   though `lazyfrogBotQueueSnapshot.count` is healthy.
 - **Cause**: `canNavigateAway` answers from the DOM
   (`isGameDialogOpen() || hasFullscreenGameIframe()`), so a victory screen that
   keeps the iframe mounted reports "still open" indefinitely.
-- **Fix**: after `DIALOG_CLOSE_MAX_RETRIES` re-checks (~20s) the background
-  fires `DIALOG_CLOSE_TIMEOUT` and navigates anyway, which tears the iframe
-  down. Look for `Dialog did not close in time — advancing to next mission`.
+- **Fix**: the state now waits `DIALOG_CLOSE_SETTLE_MS` (1s, just long enough
+  for the result to be confirmed server-side) and then fires
+  `GAME_DIALOG_CLOSED` unconditionally. Navigation removes the iframe on its
+  own, and `performMissionNavigation` keeps its own `canNavigateAway` check as
+  the remaining safety net. Look for `Victory reached — settling before
+  navigation`.
 - **Note**: the `DRY-RUN` in the devvit victory log is *not* the cause. Once a
   mission is reported complete, `enterMissionDoneNoClick` deliberately stops
   devvit clicking and hands over to the background. That is expected; it is

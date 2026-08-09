@@ -4538,10 +4538,6 @@ ${err.message}`);
   const MISSION_SYNC_PAGE_DELAY_MS = 350;
   /** How long bot start will wait on the freshness sync before carrying on without it. */
   const START_BOT_SYNC_BUDGET_MS = 2e4;
-  /** How often waitingForDialogClose re-checks whether the game dialog has gone. */
-  const DIALOG_CLOSE_RECHECK_MS = 2e3;
-  /** Re-checks before giving up on a graceful close and navigating anyway (~20s). */
-  const DIALOG_CLOSE_MAX_RETRIES = 10;
   const NAVIGATION_SETTLE_MS = 1e4;
   function getMissionMaxAgeCutoffMs(asOfMs = Date.now()) {
     return asOfMs - MISSION_QUEUE_MAX_AGE_DAYS * 24 * 60 * 60 * 1e3;
@@ -6284,7 +6280,12 @@ ${err.message}`);
     const BATCH_STORAGE_KEY = "lazyfrogBatchQueue";
     const BATCH_SIZE = 1;
     const BATCH_REFILL_SIZE = 1;
-    const DIALOG_CLOSE_SETTLE_MS = 3e3;
+    /**
+     * How long the victory screen is left alone before navigating away, so the
+     * mission result is confirmed server-side first. Not a dialog-teardown wait:
+     * navigation removes the iframe on its own.
+     */
+    const DIALOG_CLOSE_SETTLE_MS = 1e3;
     const tabsPendingClose = /* @__PURE__ */ new Set();
     let activeMissionTabId = null;
     let dialogOwnerTabId = null;
@@ -6779,8 +6780,6 @@ ${err.message}`);
     let latestMissionSyncPromise = null;
     let latestMissionSyncAt = 0;
     let idleStateCheckInterval = null;
-    let dialogCloseRetryCount = 0;
-    let dialogCloseTriggered = false;
     let dialogCloseSettleTimer = null;
     let lastMissionPageLoadedId = null;
     let lastMissionPageLoadedAt = 0;
@@ -7079,8 +7078,6 @@ ${err.message}`);
     }
     function resetDialogCloseTracking() {
       allowCompletingRefind();
-      dialogCloseTriggered = false;
-      dialogCloseRetryCount = 0;
       if (dialogCloseSettleTimer) {
         clearTimeout(dialogCloseSettleTimer);
         dialogCloseSettleTimer = null;
@@ -7347,8 +7344,6 @@ ${err.message}`);
         navigationRetryTimer = null;
       }
       lastCompletingRetryCount = -1;
-      dialogCloseRetryCount = 0;
-      dialogCloseTriggered = false;
       skipAdvanceInFlight = false;
     }
     function clearSkipAdvanceInFlightIfMissionLoaded(presentationState) {
@@ -7422,8 +7417,6 @@ ${err.message}`);
             extensionLogger.log(
               "[StateTransition] Batch mode: previous mission tab already closed, skipping dialog wait"
             );
-            dialogCloseTriggered = false;
-            dialogCloseRetryCount = 0;
             dialogOwnerTabId = null;
             if (dialogCloseSettleTimer) {
               clearTimeout(dialogCloseSettleTimer);
@@ -7432,59 +7425,39 @@ ${err.message}`);
             sendToStateMachine({ type: "GAME_DIALOG_CLOSED" });
             return;
           }
-          extensionLogger.log("[StateTransition] Waiting for game dialog to close");
-          if (!dialogCloseTriggered) {
-            dialogCloseTriggered = true;
-            sendCloseGameDialog(dialogOwnerTabId, "waitingForDialogClose", dialogOwnerTabId == null);
+          // The dialog is no longer clicked shut or waited on. By the time this
+          // state is entered the mission completion has already been reported and
+          // the next mission already chosen, and canNavigateAway() only ever
+          // inspected UI teardown (dialogOpen / fullscreenIframe) -- never
+          // server-side completion -- so the poll guarded nothing while costing up
+          // to twenty seconds per mission (ten re-checks, two seconds apart).
+          // Navigation sets window.location, which tears the iframe down by
+          // itself, and performMissionNavigation() still runs its own
+          // canNavigateAway() check and close attempts before it commits. All that
+          // remains here is a short settle so the victory result lands server-side
+          // first. This is the DIALOG_CLOSE_TIMEOUT escape hatch's destination,
+          // now reached in one second rather than twenty.
+          if (dialogCloseSettleTimer) {
+            return;
           }
-          canNavigateAway(dialogOwnerTabId).then((canNavigate) => {
-            if (canNavigate) {
-              extensionLogger.log("[StateTransition] Dialog is closed, sending GAME_DIALOG_CLOSED event");
-              dialogCloseTriggered = false;
-              dialogCloseRetryCount = 0;
-              sendToStateMachine({ type: "GAME_DIALOG_CLOSED" });
-            } else {
-              dialogCloseRetryCount += 1;
-              extensionLogger.log("[StateTransition] Dialog still open, will retry close check", {
-                retry: dialogCloseRetryCount,
-                maxRetries: DIALOG_CLOSE_MAX_RETRIES
-              });
-              // This retry loop used to be unbounded, so a dialog that would not
-              // close held the run forever. Give up and navigate instead.
-              if (dialogCloseRetryCount >= DIALOG_CLOSE_MAX_RETRIES) {
-                extensionLogger.warn(
-                  "[StateTransition] Dialog did not close in time — advancing to next mission anyway",
-                  {
-                    retries: dialogCloseRetryCount,
-                    waitedMs: dialogCloseRetryCount * DIALOG_CLOSE_RECHECK_MS,
-                    nextMission: context?.currentMissionPermalink || null
-                  }
-                );
-                dialogCloseTriggered = false;
-                dialogCloseRetryCount = 0;
-                sendToStateMachine({ type: "DIALOG_CLOSE_TIMEOUT" });
-                return;
-              }
-              if (dialogCloseRetryCount % 3 === 0) {
-                sendCloseGameDialog(dialogOwnerTabId, "waitingForDialogClose-retry", dialogOwnerTabId == null);
-              }
-              setTimeout(() => {
-                const snapshot = getStateMachineSnapshot();
-                if (snapshot?.matches?.("gameMission.waitingForDialogClose")) {
-                  extensionLogger.log("[StateTransition] Re-checking dialog status");
-                  handleStateTransition(snapshot, snapshot.context);
-                }
-              }, DIALOG_CLOSE_RECHECK_MS);
-            }
+          extensionLogger.log("[StateTransition] Victory reached — settling before navigation", {
+            settleMs: DIALOG_CLOSE_SETTLE_MS
           });
+          dialogCloseSettleTimer = setTimeout(() => {
+            dialogCloseSettleTimer = null;
+            const snapshot = getStateMachineSnapshot();
+            if (!snapshot?.matches?.("gameMission.waitingForDialogClose")) {
+              return;
+            }
+            extensionLogger.log("[StateTransition] Settle elapsed, advancing to navigation");
+            sendToStateMachine({ type: "GAME_DIALOG_CLOSED" });
+          }, DIALOG_CLOSE_SETTLE_MS);
           return;
         }
       }
       switch (presentationState) {
         case "idle":
           lastCompletingRetryCount = -1;
-          dialogCloseRetryCount = 0;
-          dialogCloseTriggered = false;
           if (dialogCloseSettleTimer) {
             clearTimeout(dialogCloseSettleTimer);
             dialogCloseSettleTimer = null;
@@ -7508,15 +7481,12 @@ ${err.message}`);
           break;
         case "error":
           lastCompletingRetryCount = -1;
-          dialogCloseRetryCount = 0;
-          dialogCloseTriggered = false;
           if (dialogCloseSettleTimer) {
             clearTimeout(dialogCloseSettleTimer);
             dialogCloseSettleTimer = null;
           }
           break;
         case "navigating":
-          dialogCloseTriggered = false;
           navigationDialogCloseAttempts = 0;
           lastNavigatingStateAt = Date.now();
           if (dialogCloseSettleTimer) {
@@ -7842,8 +7812,6 @@ ${err.message}`);
       }
       lastCompletingRetryCount = -1;
       skipAdvanceInFlight = false;
-      dialogCloseTriggered = false;
-      dialogCloseRetryCount = 0;
     }
     function handleStartBotMessage(sendResponse, sender) {
       extensionLogger.log("START_BOT received, sending to state machine");
