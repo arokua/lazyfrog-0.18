@@ -270,6 +270,43 @@ var reddit = (function() {
   const DEFAULT_MAX_STORED_LOGS = 5e3;
   const BATCH_WRITE_INTERVAL = 1e4;
   const BATCH_SIZE_THRESHOLD = 50;
+  // Content-script log relay. See the matching note in devvit.js: entries are
+  // batched so that relaying does not become the worker's busiest workload.
+  const REMOTE_LOG_BATCH_MAX = 50;
+  const REMOTE_LOG_BATCH_MS = 250;
+  let remoteLogBatch = [];
+  let remoteLogBatchUrl = "";
+  let remoteLogBatchTimer = null;
+  function flushRemoteLogBatch() {
+    if (remoteLogBatchTimer) {
+      clearTimeout(remoteLogBatchTimer);
+      remoteLogBatchTimer = null;
+    }
+    if (!remoteLogBatch.length) return;
+    const entries = remoteLogBatch;
+    remoteLogBatch = [];
+    try {
+      chrome.runtime.sendMessage(
+        { type: "REMOTE_LOG", entries, remoteUrl: remoteLogBatchUrl },
+        () => {
+          // Touch lastError so a sleeping worker does not print "Unchecked
+          // runtime.lastError". Never log from in here -- it would recurse.
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch {
+      // Extension context torn down by a reload/update. Drop the batch.
+    }
+  }
+  function queueRemoteLogEntry(entry, remoteUrl) {
+    remoteLogBatchUrl = remoteUrl;
+    remoteLogBatch.push(entry);
+    if (remoteLogBatch.length >= REMOTE_LOG_BATCH_MAX) {
+      flushRemoteLogBatch();
+    } else if (!remoteLogBatchTimer) {
+      remoteLogBatchTimer = setTimeout(flushRemoteLogBatch, REMOTE_LOG_BATCH_MS);
+    }
+  }
   const _Logger = class _Logger {
     constructor(context, config, parentContext) {
       this.parentContext = parentContext;
@@ -334,18 +371,7 @@ var reddit = (function() {
      */
     async sendToRemote(entry) {
       if (!this.config.remoteLogging) return;
-      try {
-        chrome.runtime.sendMessage(
-          { type: "REMOTE_LOG", entry, remoteUrl: this.config.remoteUrl },
-          () => {
-            // Touch lastError so a sleeping worker does not print "Unchecked
-            // runtime.lastError". Never log from in here -- it would recurse.
-            void chrome.runtime.lastError;
-          }
-        );
-      } catch {
-        // Extension context torn down by a reload/update. Nothing to do.
-      }
+      queueRemoteLogEntry(entry, this.config.remoteUrl);
     }
     /**
      * Flush buffered logs to chrome.storage

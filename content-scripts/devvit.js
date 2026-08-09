@@ -343,6 +343,47 @@ var devvit = (function() {
       );
     }
   }
+  // Content-script log relay. Entries are batched before crossing into the
+  // service worker. With the old "one attempt per 2s" throttle gone, a busy
+  // mission emits far more lines than it used to, and one runtime message plus
+  // one POST per line is enough traffic on its own to keep the worker
+  // permanently awake -- the worker logs each message it receives, so unbatched
+  // relaying makes logging its own busiest source of work.
+  const REMOTE_LOG_BATCH_MAX = 50;
+  const REMOTE_LOG_BATCH_MS = 250;
+  let remoteLogBatch = [];
+  let remoteLogBatchUrl = "";
+  let remoteLogBatchTimer = null;
+  function flushRemoteLogBatch() {
+    if (remoteLogBatchTimer) {
+      clearTimeout(remoteLogBatchTimer);
+      remoteLogBatchTimer = null;
+    }
+    if (!remoteLogBatch.length) return;
+    const entries = remoteLogBatch;
+    remoteLogBatch = [];
+    try {
+      chrome.runtime.sendMessage(
+        { type: "REMOTE_LOG", entries, remoteUrl: remoteLogBatchUrl },
+        () => {
+          // Touch lastError so a sleeping worker does not print "Unchecked
+          // runtime.lastError". Never log from in here -- it would recurse.
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch {
+      // Extension context torn down by a reload/update. Drop the batch.
+    }
+  }
+  function queueRemoteLogEntry(entry, remoteUrl) {
+    remoteLogBatchUrl = remoteUrl;
+    remoteLogBatch.push(entry);
+    if (remoteLogBatch.length >= REMOTE_LOG_BATCH_MAX) {
+      flushRemoteLogBatch();
+    } else if (!remoteLogBatchTimer) {
+      remoteLogBatchTimer = setTimeout(flushRemoteLogBatch, REMOTE_LOG_BATCH_MS);
+    }
+  }
   const _Logger = class _Logger {
     constructor(context, config, parentContext) {
       this.parentContext = parentContext;
@@ -405,18 +446,7 @@ var devvit = (function() {
      */
     async sendToRemote(entry) {
       if (!this.config.remoteLogging) return;
-      try {
-        chrome.runtime.sendMessage(
-          { type: "REMOTE_LOG", entry, remoteUrl: this.config.remoteUrl },
-          () => {
-            // Touch lastError so a sleeping worker does not print "Unchecked
-            // runtime.lastError". Never log from in here -- it would recurse.
-            void chrome.runtime.lastError;
-          }
-        );
-      } catch {
-        // Extension context torn down by a reload/update. Nothing to do.
-      }
+      queueRemoteLogEntry(entry, this.config.remoteUrl);
     }
     static disableStorage() {
       _Logger.storageDisabled = true;

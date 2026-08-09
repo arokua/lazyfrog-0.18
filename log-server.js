@@ -230,8 +230,15 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const raw = await readBody(req);
-    const entry = JSON.parse(raw);
-    const result = handleLogEntry(entry);
+    const parsed = JSON.parse(raw);
+    // The extension batches entries to keep its service worker from spending
+    // more time relaying logs than doing work. A bare object is still accepted
+    // so an older extension build keeps working against a newer server.
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed) handleLogEntry(entry);
+    } else {
+      handleLogEntry(parsed);
+    }
     res.writeHead(204);
     res.end();
   } catch (err) {

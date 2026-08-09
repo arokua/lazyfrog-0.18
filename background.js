@@ -3058,6 +3058,7 @@ ${err.message}`);
   // Backpressure now comes from a bounded queue, and backoff only from real
   // failures.
   const REMOTE_LOG_QUEUE_LIMIT = 2e3;
+  const REMOTE_LOG_POST_BATCH = 100;
   const REMOTE_LOG_FAILURE_LIMIT = 3;
   const REMOTE_LOG_BACKOFF_MS = 5 * 60 * 1e3;
   const remoteLogQueue = [];
@@ -3109,12 +3110,20 @@ ${err.message}`);
           remoteLogQueue.length = 0;
           return;
         }
-        const next = remoteLogQueue.shift();
+        // Drain as an array in one POST. Each entry was serialized on the way
+        // in, so one unserializable entry cannot poison the batch, and /log
+        // accepts either a single object or an array.
+        const url = remoteLogQueue[0].url;
+        const bodies = [];
+        while (remoteLogQueue.length && bodies.length < REMOTE_LOG_POST_BATCH) {
+          if (remoteLogQueue[0].url !== url) break;
+          bodies.push(remoteLogQueue.shift().body);
+        }
         try {
-          const response = await fetch(next.url, {
+          const response = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: next.body
+            body: `[${bodies.join(",")}]`
           });
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
@@ -7961,11 +7970,17 @@ ${err.message}`);
       broadcastToAllFrames({ type: "STOP_MISSION_AUTOMATION" });
     }
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      extensionLogger.log("Received message", {
-        type: message.type,
-        source: sender.tab ? `tab ${sender.tab.id}` : "extension",
-        frameId: sender.frameId
-      });
+      // REMOTE_LOG is the log relay itself. Logging its arrival makes every
+      // content-script line produce a second line here, doubling both the POST
+      // volume and the worker's own wakeups -- logging would become the biggest
+      // thing the worker does.
+      if (message.type !== "REMOTE_LOG") {
+        extensionLogger.log("Received message", {
+          type: message.type,
+          source: sender.tab ? `tab ${sender.tab.id}` : "extension",
+          frameId: sender.frameId
+        });
+      }
       if (message.type === "PING") {
         const snapshot2 = getStateMachineSnapshot();
         const state = getPresentationStateName(snapshot2);
@@ -8161,9 +8176,17 @@ ${err.message}`);
           break;
         // Events from content scripts → state machine
         case "REMOTE_LOG":
-          // A content script's log line. Only extension contexts can reach this
-          // listener (no externally_connectable), so the payload is ours.
-          enqueueRemoteLogEntry(message.entry, message.remoteUrl);
+          // A batch of content-script log lines. Only extension contexts can
+          // reach this listener (no externally_connectable), so the payload is
+          // ours. `entry` is the single-entry form kept for older frames still
+          // running a pre-batching content script after an extension update.
+          if (Array.isArray(message.entries)) {
+            for (const item of message.entries) {
+              enqueueRemoteLogEntry(item, message.remoteUrl);
+            }
+          } else if (message.entry) {
+            enqueueRemoteLogEntry(message.entry, message.remoteUrl);
+          }
           sendResponse({ ok: true });
           break;
         case "GET_CURRENT_MISSION_ID":
