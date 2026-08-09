@@ -1126,6 +1126,7 @@ var devvit = (function() {
       this._hollowUiNudgedReady = false;
       this._lastScreenLogAt = 0;
       this._lastLoggedScreen = "";
+      this._lastStaleQueueStateLogAt = 0;
       this._tabBackgroundSinceMs = 0;
       this.config = {
         ...DEFAULT_GIAE_CONFIG,
@@ -2512,11 +2513,41 @@ var devvit = (function() {
         return false;
       }
     }
+    /**
+     * Screens that can only exist while a mission is actually being played. A
+     * queue-leaving presentation state that contradicts one of these is stale.
+     */
+    isMidMissionActionableUi(screen) {
+      return screen === "battle" || screen === "choice" || screen === "crossroads" || screen === "bargain";
+    }
     shouldPauseGameClicking(screen = this.gameState.currentScreen) {
       if (this.isOnVictoryAdvanceUi(screen)) {
         return false;
       }
-      return this.missionDoneNoClick || isQueueLeavingBotState();
+      if (this.missionDoneNoClick) {
+        return true;
+      }
+      if (isQueueLeavingBotState()) {
+        // lazyfrogBotPresentationState is a mirror of the background's state, fed
+        // by STATE_CHANGED messages and storage events. A content script that
+        // loads while the run is navigating caches "navigating" and only learns
+        // better from the next update -- which never arrives, because the update
+        // that would clear it comes from mission progress that this very flag is
+        // preventing. A live battle or choice screen is proof the mirror is out
+        // of date, so believe the screen rather than the mirror.
+        if (!this.isMidMissionActionableUi(screen)) {
+          return true;
+        }
+        const now = Date.now();
+        if (now - this._lastStaleQueueStateLogAt > 3e4) {
+          this._lastStaleQueueStateLogAt = now;
+          devvitGIAELogger.warn("Ignoring stale queue-leaving state — mission UI is live", {
+            presentationState: lazyfrogBotPresentationState,
+            screen
+          });
+        }
+      }
+      return false;
     }
     syncRunModeFromSession() {
       if (this.shouldPauseGameClicking()) {
