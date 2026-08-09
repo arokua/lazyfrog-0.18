@@ -1107,6 +1107,10 @@ var devvit = (function() {
       this.isProcessing = false;
       this.ACTIVE_INTERVAL_MS = 1e3;
       this.MONITORING_INTERVAL_MS = 5e3;
+      // "unknown" is the screen fallback whenever findAllButtons() comes back
+      // empty, which a transient render gap also produces. Post-victory idle is
+      // only believed once the unknown screen has held for this long.
+      this.POST_VICTORY_UNKNOWN_GRACE_MS = 3e3;
       this.currentPostId = null;
       this.missionMetadata = null;
       this.innCompletionHandled = false;
@@ -1304,6 +1308,13 @@ var devvit = (function() {
         }
         const screenChanged = this.gameState.currentScreen !== screen;
         this.gameState.currentScreen = screen;
+        if (screen === "unknown") {
+          if (!this._unknownSinceMs) {
+            this._unknownSinceMs = now;
+          }
+        } else {
+          this._unknownSinceMs = 0;
+        }
         if (this.shouldPauseGameClicking(screen)) {
           if (screenChanged) {
             this.reportGameState();
@@ -1321,6 +1332,16 @@ var devvit = (function() {
           return;
         }
         if (this.victoryCompletionReported && (screen === "start" || screen === "unknown" || screen === "in_progress")) {
+          // "start" and "in_progress" are positive detections, so they are acted on
+          // at once. "unknown" only means no buttons were found this tick, and
+          // enterMissionDoneNoClick() is a latch that nothing but a new mission
+          // clears -- so a single empty tick must not be allowed to strand the bot.
+          if (screen === "unknown" && now - this._unknownSinceMs < this.POST_VICTORY_UNKNOWN_GRACE_MS) {
+            if (screenChanged) {
+              this.reportGameState();
+            }
+            return;
+          }
           this.enterMissionDoneNoClick(`post-victory-${screen}`);
           if (screenChanged) {
             this.reportGameState();
@@ -3002,6 +3023,10 @@ var devvit = (function() {
     gameAutomation.victoryFlowGiveUpAt = 0;
     gameAutomation.victoryCompletionReported = false;
     gameAutomation.innCompletionHandled = false;
+    // Without this the latch survives a stop/start cycle: start() re-enables the
+    // config and restarts the interval, but every processGame() tick still bails
+    // out of shouldPauseGameClicking(), so the bot reads ACTIVE and does nothing.
+    gameAutomation.missionDoneNoClick = false;
   }
   function toggleAutomation(enabled, reason = "unspecified") {
     const alreadyEnabled = !!gameAutomation?.config?.enabled;
