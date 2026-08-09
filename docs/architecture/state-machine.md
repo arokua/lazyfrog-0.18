@@ -320,6 +320,26 @@ chrome.runtime.sendMessage({
 });
 ```
 
+**Boundary with the queue** — the clicker is intentionally independent of the
+state machine. The queue navigates *between* missions; the clicker presses
+whatever the game renders *inside* one. The two meet at exactly one lever:
+
+| Lever | Owner | Scope | Cleared by |
+| --- | --- | --- | --- |
+| `missionDoneNoClick` | either side | one mission | the next mission's `initialData`, `resetSessionForMissionSwitch()`, `abortVictoryFlowState()`, or a live mid-mission screen |
+
+`lazyfrogBotPresentationState` is a *mirror* of the machine's state, delivered
+over `STATE_CHANGED` messages and storage events, so it lags. Do not gate
+clicking on it. Doing so caused two long-running bugs:
+
+- A frame that painted its **Start** button before the mirror left `navigating`
+  never got clicked, so the queue timed the mission out and skipped it.
+- Any non-battle screen (`start`, `skip`, `daily_treats`, `creatorBonus`) was
+  treated as "not really mid-mission" and sat out until the mirror caught up.
+
+The gate also protected nothing: a frame with nothing to click already reports
+screen `unknown` and takes no action on its own.
+
 ## Debugging
 
 ### Console Access

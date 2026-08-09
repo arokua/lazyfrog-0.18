@@ -1126,7 +1126,6 @@ var devvit = (function() {
       this._hollowUiNudgedReady = false;
       this._lastScreenLogAt = 0;
       this._lastLoggedScreen = "";
-      this._lastStaleQueueStateLogAt = 0;
       this.telemetrySnapshot = null;
       this._tabBackgroundSinceMs = 0;
       this.config = {
@@ -2518,38 +2517,47 @@ var devvit = (function() {
       }
     }
     /**
-     * Screens that can only exist while a mission is actually being played. A
-     * queue-leaving presentation state that contradicts one of these is stale.
+     * Screens that can only exist part-way through a mission that is still being
+     * played. None of them can be reached once the mission is over, so any
+     * "stop clicking" state that survives into one of them is provably stale.
      */
     isMidMissionActionableUi(screen) {
       return screen === "battle" || screen === "choice" || screen === "crossroads" || screen === "bargain";
     }
+    /**
+     * The clicker is deliberately independent of the mission queue: its whole job
+     * is to press whatever the game is showing this frame. The queue's job is to
+     * navigate between missions, and it owns exactly one lever over the clicker --
+     * missionDoneNoClick, which is per-mission and cleared by the next mission's
+     * initialData.
+     *
+     * The bot's presentation state (navigating/completing/waitingForDialogClose)
+     * is deliberately NOT consulted. It is a mirror of background state delivered
+     * over storage events, so it lags -- and it lagged in the one direction that
+     * matters: a frame that renders its Start button before the mirror leaves
+     * "navigating" would never get clicked, and the queue would then time the
+     * mission out and skip it. Gating clicks on it bought nothing either, because
+     * a frame that genuinely has nothing to click reports screen "unknown" and
+     * takes no action regardless.
+     */
     shouldPauseGameClicking(screen = this.gameState.currentScreen) {
       if (this.isOnVictoryAdvanceUi(screen)) {
         return false;
       }
       if (this.missionDoneNoClick) {
-        return true;
-      }
-      if (isQueueLeavingBotState()) {
-        // lazyfrogBotPresentationState is a mirror of the background's state, fed
-        // by STATE_CHANGED messages and storage events. A content script that
-        // loads while the run is navigating caches "navigating" and only learns
-        // better from the next update -- which never arrives, because the update
-        // that would clear it comes from mission progress that this very flag is
-        // preventing. A live battle or choice screen is proof the mirror is out
-        // of date, so believe the screen rather than the mirror.
-        if (!this.isMidMissionActionableUi(screen)) {
-          return true;
-        }
-        const now = Date.now();
-        if (now - this._lastStaleQueueStateLogAt > 3e4) {
-          this._lastStaleQueueStateLogAt = now;
-          devvitGIAELogger.warn("Ignoring stale queue-leaving state — mission UI is live", {
+        // A mid-mission screen cannot follow mission completion, so the latch is
+        // measuring a mission that has already been replaced -- most likely the
+        // next mission loaded into this frame without an initialData message to
+        // reset us. Self-heal rather than sit out the whole mission.
+        if (this.isMidMissionActionableUi(screen)) {
+          this.missionDoneNoClick = false;
+          devvitGIAELogger.warn("Clearing stale mission-done latch — mid-mission UI is live", {
             presentationState: lazyfrogBotPresentationState,
             screen
           });
+          return false;
         }
+        return true;
       }
       return false;
     }
@@ -2811,14 +2819,6 @@ var devvit = (function() {
   let botSessionActive = false;
   let autoPlayEnabled = true;
   let lazyfrogBotPresentationState = "idle";
-  const QUEUE_LEAVING_BOT_STATES = /* @__PURE__ */ new Set([
-    "completing",
-    "waitingForDialogClose",
-    "navigating"
-  ]);
-  function isQueueLeavingBotState(state = lazyfrogBotPresentationState) {
-    return QUEUE_LEAVING_BOT_STATES.has(state);
-  }
   function refreshLazyfrogBotPresentationState(stored) {
     lazyfrogBotPresentationState = stored?.lazyfrogBotPresentationState || "idle";
   }
