@@ -227,6 +227,31 @@ botActor.subscribe((state) => {
 });
 ```
 
+### Surviving a service worker restart
+
+Persisting the state is not the same as resuming from it. The actor itself does
+not survive: Chrome reclaims idle service workers and force-terminates any whose
+handler overruns its budget, and the worker that comes back calls `createActor`
+fresh, landing in `idle` with `botRunActive === false`.
+
+The page side does not reset with it. `activeBotSession` sits in
+`chrome.storage.local`, so the devvit clicker re-enables itself and waits for a
+mission, while `handleStateTransition` discards every transition because
+`botRunActive` says nothing is running. The bot reports `idle` at the inn
+forever, and only a manual Stop → Start clears it.
+
+`resumeBotSessionAfterWorkerRestart()` closes that gap. On boot, once
+`initializeExtension()` has finished its migrations, it re-reads
+`activeBotSession` and — if a Reddit tab is still open — calls
+`handleStartBotMessage`, the same entry point the popup's Start button uses. A
+deliberate Stop removes the flag, so a stopped bot stays stopped.
+
+The restart budget in `lazyfrogSessionResume` (5 attempts per 10 minutes) exists
+because the resume could be what kills the worker; without it the two would
+reboot each other indefinitely. Clearing a mission is proof the run is healthy
+and resets the count, so a long overnight session cannot exhaust the budget one
+respawn at a time.
+
 ## Content Script Architecture
 
 ### Reddit Content Script (`src/content/reddit/reddit.tsx`)

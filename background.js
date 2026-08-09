@@ -7983,7 +7983,11 @@ ${err.message}`);
       startSenderTabId = null;
       sendResponse({ success: true, ack: "sync" });
       sendToStateMachine({ type: "STOP_BOT" });
-      chrome.storage.local.remove(["activeBotSession", "lazyfrogCurrentMissionId"]);
+      chrome.storage.local.remove([
+        "activeBotSession",
+        "lazyfrogCurrentMissionId",
+        SESSION_RESUME_KEY
+      ]);
       chrome.storage.local.set({ lazyfrogBotPresentationState: "idle" });
       releaseAllTabKeepAlive().catch((error) => {
         extensionLogger.warn("[KeepAlive] Failed on STOP_BOT", { error: String(error) });
@@ -7991,6 +7995,61 @@ ${err.message}`);
       gamePreviewReloadAttempts.clear();
       void closeAllBatchTabs();
       broadcastToAllFrames({ type: "STOP_MISSION_AUTOMATION" });
+    }
+    // A service worker can disappear at any moment — Chrome reclaims idle ones,
+    // and kills outright any whose handler overruns its budget. What comes back
+    // is a blank slate: createActor starts the machine in `idle` and
+    // botRunActive is false again. The page side does not reset with it.
+    // `activeBotSession` lives in storage, so devvit re-enables its clicker and
+    // waits for a mission the queue will never send, while handleStateTransition
+    // drops every transition because botRunActive says no run is in progress.
+    // The bot sits at the inn reporting "idle" until someone presses Start.
+    //
+    // Storage is the only thing that survives the restart, and activeBotSession
+    // is already the record of the user's intent, so restart the run from it.
+    // A deliberate Stop removes the flag, so a stopped bot stays stopped.
+    const SESSION_RESUME_KEY = "lazyfrogSessionResume";
+    const SESSION_RESUME_WINDOW_MS = 10 * 60 * 1e3;
+    const SESSION_RESUME_LIMIT = 5;
+    const SESSION_RESUME_SETTLE_MS = 2e3;
+    async function resumeBotSessionAfterWorkerRestart() {
+      const stored = await chrome.storage.local.get([
+        "activeBotSession",
+        "lazyfrogBotPresentationState",
+        SESSION_RESUME_KEY
+      ]);
+      if (!stored.activeBotSession) return;
+      const tabs = await chrome.tabs.query({ url: "*://*.reddit.com/*" });
+      if (!tabs.length) {
+        extensionLogger.log("[SessionResume] Session flag set but no Reddit tab — leaving it alone");
+        return;
+      }
+      // Should the resume itself be what kills the worker, this stops the pair
+      // of them rebooting each other indefinitely.
+      const now = Date.now();
+      const prior = stored[SESSION_RESUME_KEY];
+      const inWindow = !!prior && now - prior.firstAt < SESSION_RESUME_WINDOW_MS;
+      const attempt = inWindow ? prior.count + 1 : 1;
+      if (attempt > SESSION_RESUME_LIMIT) {
+        extensionLogger.error("[SessionResume] Worker keeps restarting — stopping the bot", {
+          attempts: prior.count,
+          windowMs: now - prior.firstAt
+        });
+        await chrome.storage.local.remove(["activeBotSession", SESSION_RESUME_KEY]);
+        broadcastToAllFrames({ type: "STOP_MISSION_AUTOMATION" });
+        return;
+      }
+      await chrome.storage.local.set({
+        [SESSION_RESUME_KEY]: { count: attempt, firstAt: inWindow ? prior.firstAt : now, lastAt: now }
+      });
+      extensionLogger.warn("[SessionResume] Restarting the run after a worker restart", {
+        attempt,
+        stateBeforeRestart: stored.lazyfrogBotPresentationState || null
+      });
+      // The content scripts reconnect on their own schedule; starting before
+      // they have re-registered wastes the attempt on an empty broadcast.
+      await new Promise((resolve) => setTimeout(resolve, SESSION_RESUME_SETTLE_MS));
+      handleStartBotMessage(() => {}, {});
     }
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // REMOTE_LOG is the log relay itself. Logging its arrival makes every
@@ -8639,6 +8698,10 @@ ${err.message}`);
                 extensionLogger.log("Mission marked as cleared in storage", {
                   postId: completedPostId
                 });
+                // A cleared mission is proof the run is healthy, so the restart
+                // budget starts over — an all-night session must not exhaust it
+                // one respawn at a time.
+                chrome.storage.local.remove([SESSION_RESUME_KEY]);
                 const snapshotDone = getStateMachineSnapshot();
                 const machineState = getPresentationStateName(snapshotDone);
                 if (BOT_TERMINAL_PRESENTATION_STATES.includes(machineState) && !botRunActive) {
@@ -9114,7 +9177,11 @@ ${err.message}`);
         extensionLogger.error("[ProgressMigration] Migration check failed", { error: String(error) });
       }
     }
-    initializeExtension();
+    initializeExtension().then(
+      () => resumeBotSessionAfterWorkerRestart().catch((error) => {
+        extensionLogger.error("[SessionResume] Failed", { error: String(error) });
+      })
+    );
     extensionLogger.log("Sword & Supper Bot background script loaded");
   });
   function initPlugins() {
