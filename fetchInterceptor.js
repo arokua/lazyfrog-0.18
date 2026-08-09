@@ -18,6 +18,11 @@ var fetchinterceptor = (function() {
     /game/i,
     /run/i,
     /loot/i,
+    // Gear changes: PUT /api/player/loadouts/{i} and POST /api/inventory/action.
+    // These are requested with root-relative URLs, so the devvit.net patterns
+    // above never matched them and a failure here left no trace at all.
+    /\/api\/player\//i,
+    /\/api\/inventory\//i,
     /Custom(?:Post|Action)/i
   ];
   function shouldDebugLogUrl(url) {
@@ -38,6 +43,26 @@ var fetchinterceptor = (function() {
       return btoa(binary);
     } catch {
       return "";
+    }
+  }
+  /**
+   * Best-effort copy of an outgoing body. A 4xx/5xx is usually explained by what
+   * was sent rather than what came back, and the response alone cannot show
+   * which item ids a rejected loadout referenced.
+   *
+   * Only plain strings are read: a stream can be consumed once, and draining it
+   * here would leave nothing for the actual request.
+   */
+  function requestBodyPreview(config, resource) {
+    try {
+      const body = config?.body ?? (resource instanceof Request ? null : null);
+      if (typeof body === "string") {
+        return body.length > 8192 ? `${body.slice(0, 8192)}...[truncated]` : body;
+      }
+      if (body == null) return null;
+      return `[${body.constructor?.name || typeof body} not captured]`;
+    } catch {
+      return null;
     }
   }
   function headersToPlain(input) {
@@ -125,6 +150,8 @@ var fetchinterceptor = (function() {
                   status: response.status,
                   postId: postId || null,
                   requestHeaders: headers,
+                  requestBody: requestBodyPreview(config, resource),
+                  ok: response.ok,
                   responseHeaders,
                   bodyBase64: base64,
                   bodyLength: buffer.byteLength,
@@ -137,6 +164,29 @@ var fetchinterceptor = (function() {
           });
         }
         return response;
+      }).catch((error) => {
+        // A rejected fetch produces no response to clone, so without this a
+        // request that never reached the server looks identical in the log to
+        // one that was never made.
+        if (debugEnabled) {
+          window.dispatchEvent(
+            new CustomEvent("lazyfrog:fetch-debug", {
+              detail: {
+                url,
+                method,
+                status: 0,
+                ok: false,
+                postId: postId || null,
+                requestHeaders: headers,
+                requestBody: requestBodyPreview(config, resource),
+                networkError: String(error),
+                elapsedMs: Date.now() - startedAt,
+                startedAt
+              }
+            })
+          );
+        }
+        throw error;
       });
     };
   });
