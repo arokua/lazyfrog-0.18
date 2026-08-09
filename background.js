@@ -2,6 +2,7 @@
 // Classic service worker, so importScripts is available and runs synchronously
 // before the bundle body below. Exposes globalThis.LazyFrogMissionCore.
 importScripts("/lib/missionCore.js");
+importScripts("/lib/missionTelemetry.js");
 
 var background = (function() {
   "use strict";
@@ -6717,6 +6718,45 @@ ${err.message}`);
     function isGameSessionProtectedFromResponse(response) {
       return !!(response?.isOpen ?? response?.dialogOpen);
     }
+    /**
+     * Append one completed mission to the telemetry CSV store.
+     *
+     * The encounter metrics ride in on the content script's snapshot, taken at
+     * initialData time -- by now the mission is about to be compactCleared and
+     * its encounters are gone. A completion without a snapshot (a mission the
+     * bot joined mid-flight, say) is skipped rather than written as zeroes,
+     * which would look like a real zero-enemy mission in the regression.
+     */
+    async function recordMissionTelemetry({ snapshot, completionSource }) {
+      const telemetry = globalThis.LazyFrogMissionTelemetry;
+      if (!telemetry || !snapshot) return;
+      try {
+        const stored = await chrome.storage.local.get(["automationConfig", telemetry.TELEMETRY_STORAGE_KEY]);
+        const row = telemetry.buildTelemetryRow({
+          snapshot: { ...snapshot, navigationStartedMs: telemetryNavStartedMs },
+          completedAtMs: Date.now(),
+          outcome: "cleared",
+          completionSource,
+          config: stored.automationConfig || {},
+          extensionVersion: chrome.runtime.getManifest()?.version || ""
+        });
+        if (!row) return;
+        const rows = telemetry.appendRow(stored[telemetry.TELEMETRY_STORAGE_KEY], row);
+        await chrome.storage.local.set({ [telemetry.TELEMETRY_STORAGE_KEY]: rows });
+        extensionLogger.log("[Telemetry] Mission row recorded", {
+          postId: row.postId,
+          enemyCount: row.enemyCount,
+          playMs: row.playMs,
+          wallMs: row.wallMs,
+          totalRows: rows.length
+        });
+      } catch (error) {
+        // Telemetry must never take the run down with it.
+        extensionLogger.warn("[Telemetry] Could not record mission row", { error: String(error) });
+      } finally {
+        telemetryNavStartedMs = 0;
+      }
+    }
     async function canNavigateAway(targetTabId = null) {
       return new Promise((resolve) => {
         const finishCheck = (response, hadError, errorMessage) => {
@@ -6785,6 +6825,12 @@ ${err.message}`);
     let lastMissionPageLoadedAt = 0;
     let lastNavigationUrl = null;
     let lastNavigationAt = 0;
+    /**
+     * When the current mission's navigation was committed, for the telemetry
+     * wall clock. Separate from lastNavigationAt, which is also used for
+     * debouncing and gets cleared on paths telemetry should survive.
+     */
+    let telemetryNavStartedMs = 0;
     let lastNavigatingStateAt = 0;
     let navigationRetryTimer = null;
     let navigationDialogCloseAttempts = 0;
@@ -7029,6 +7075,7 @@ ${err.message}`);
       syncBotProtectedTabsToStorage();
       lastNavigationUrl = targetPermalink;
       lastNavigationAt = Date.now();
+      telemetryNavStartedMs = lastNavigationAt;
       try {
         await chrome.tabs.update(targetTab.id, { url: targetPermalink });
       } catch (error) {
@@ -8480,6 +8527,10 @@ ${err.message}`);
               postId: completedPostId,
               tabId: senderTabId,
               source: message.source
+            });
+            recordMissionTelemetry({
+              snapshot: message.telemetrySnapshot,
+              completionSource: message.source
             });
             if (completedPostId) {
               gamePreviewReloadAttempts.delete(completedPostId);

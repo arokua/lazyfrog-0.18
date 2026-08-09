@@ -1009,7 +1009,8 @@ const AutomationTab = () => {
     blessingStatPriority: [],
     skillBargainStrategy: "positive-only",
     crossroadsStrategy: "fight",
-    creatorBonusPreference: "coin"
+    creatorBonusPreference: "coin",
+    telemetryBuild: ""
   });
   const [discoveredAbilities, setDiscoveredAbilities] = reactExports.useState([]);
   const [discoveredBlessingStats, setDiscoveredBlessingStats] = reactExports.useState([]);
@@ -1021,7 +1022,8 @@ const AutomationTab = () => {
           blessingStatPriority: result.automationConfig.blessingStatPriority || [],
           skillBargainStrategy: result.automationConfig.skillBargainStrategy || "positive-only",
           crossroadsStrategy: result.automationConfig.crossroadsStrategy || "fight",
-          creatorBonusPreference: result.automationConfig.creatorBonusPreference || "coin"
+          creatorBonusPreference: result.automationConfig.creatorBonusPreference || "coin",
+          telemetryBuild: result.automationConfig.telemetryBuild || ""
         });
       }
       setDiscoveredAbilities(result.discoveredAbilities || []);
@@ -1036,7 +1038,8 @@ const AutomationTab = () => {
         blessingStatPriority: config.blessingStatPriority,
         skillBargainStrategy: config.skillBargainStrategy,
         crossroadsStrategy: config.crossroadsStrategy,
-        creatorBonusPreference: config.creatorBonusPreference
+        creatorBonusPreference: config.creatorBonusPreference,
+        telemetryBuild: config.telemetryBuild
       };
       chrome.storage.local.set({ automationConfig: fullConfig });
     });
@@ -1129,7 +1132,67 @@ const AutomationTab = () => {
             ]
           }
         )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "form-group", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("label", { children: "Build label (telemetry):" }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "13px", marginTop: "4px", marginBottom: "8px" }, children: "Free-text name for the build you are currently running, e.g. 'lightning-crit' or 'tank-v2'. Recorded on every completed mission so clear times can be compared across builds. Change it whenever you respec." }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "input",
+          {
+            type: "text",
+            value: config.telemetryBuild,
+            placeholder: "unnamed",
+            onChange: (e) => setConfig((prev) => ({ ...prev, telemetryBuild: e.target.value }))
+          }
+        )
       ] })
+    ] })
+  ] });
+};
+const TelemetryCard = () => {
+  const [rowCount, setRowCount] = reactExports.useState(0);
+  const telemetry = globalThis.LazyFrogMissionTelemetry;
+  const storageKey = telemetry?.TELEMETRY_STORAGE_KEY || "lazyfrogTelemetryRows";
+  const refreshCount = reactExports.useCallback(() => {
+    chrome.storage.local.get([storageKey], (result) => {
+      setRowCount((result[storageKey] || []).length);
+    });
+  }, [storageKey]);
+  reactExports.useEffect(() => {
+    refreshCount();
+    const listener = (changes, area) => {
+      if (area === "local" && changes[storageKey]) refreshCount();
+    };
+    chrome.storage.onChanged.addListener(listener);
+    return () => chrome.storage.onChanged.removeListener(listener);
+  }, [refreshCount, storageKey]);
+  const handleDownload = () => {
+    chrome.storage.local.get([storageKey], (result) => {
+      const rows = result[storageKey] || [];
+      if (!telemetry) return;
+      const blob = new Blob([telemetry.toCsv(rows)], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `lazyfrog-telemetry-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  };
+  const handleClear = () => {
+    if (!window.confirm(`Delete all ${rowCount} collected telemetry rows? This cannot be undone.`)) return;
+    chrome.storage.local.set({ [storageKey]: [] }, refreshCount);
+  };
+  return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "card", children: [
+    /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { children: "Mission telemetry" }),
+    /* @__PURE__ */ jsxRuntimeExports.jsx("p", { style: { color: "#a1a1aa", fontSize: "13px", marginTop: "4px", marginBottom: "12px" }, children: "One row per completed mission: encounter mix, enemy count, both clear-time clocks, the automation options in force, your build label and the game speed. Intended for regression analysis." }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("p", { style: { marginBottom: "12px" }, children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx("strong", { children: rowCount }),
+      " rows collected"
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { style: { display: "flex", gap: "8px" }, children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: handleDownload, disabled: rowCount === 0, children: "Download CSV" }),
+      /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: handleClear, disabled: rowCount === 0, children: "Clear rows" })
     ] })
   ] });
 };
@@ -1879,6 +1942,7 @@ const SettingsTab = () => {
       )
     ] }),
     /* @__PURE__ */ jsxRuntimeExports.jsx(CompleteBackupCard, {}),
+    /* @__PURE__ */ jsxRuntimeExports.jsx(TelemetryCard, {}),
     /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "card", children: [
       /* @__PURE__ */ jsxRuntimeExports.jsxs("h2", { children: [
         /* @__PURE__ */ jsxRuntimeExports.jsx(

@@ -1127,6 +1127,7 @@ var devvit = (function() {
       this._lastScreenLogAt = 0;
       this._lastLoggedScreen = "";
       this._lastStaleQueueStateLogAt = 0;
+      this.telemetrySnapshot = null;
       this._tabBackgroundSinceMs = 0;
       this.config = {
         ...DEFAULT_GIAE_CONFIG,
@@ -1189,6 +1190,9 @@ var devvit = (function() {
             this.gameState.setMissionData(data.missionMetadata, data.postId);
             this.currentPostId = data.postId;
             this.missionMetadata = data.missionMetadata;
+            // Snapshot for telemetry while the encounters still exist: clearing a
+            // mission rewrites it as compactCleared, which drops the array.
+            this.captureTelemetrySnapshot(data.postId, data.missionMetadata);
             this.innCompletionHandled = false;
       this.missionDoneNoClick = false;
             this.victoryFlow = null;
@@ -2603,6 +2607,29 @@ var devvit = (function() {
         });
       });
     }
+    /**
+     * Record the encounter mix and the moment play began, for the telemetry row
+     * assembled in the background on completion. Only the live initialData
+     * payload carries `encounters` -- the stored mission record never does -- so
+     * this is the one opportunity to measure the mission's combat load.
+     */
+    captureTelemetrySnapshot(postId, missionMetadata) {
+      const telemetry = globalThis.LazyFrogMissionTelemetry;
+      if (!telemetry) {
+        this.telemetrySnapshot = null;
+        return;
+      }
+      try {
+        this.telemetrySnapshot = telemetry.buildMissionSnapshot({
+          postId,
+          missionMetadata,
+          playStartedMs: Date.now()
+        });
+      } catch (err) {
+        this.telemetrySnapshot = null;
+        devvitGIAELogger.warn("[Telemetry] Could not snapshot mission", { error: String(err) });
+      }
+    }
     async reportMissionCompletion(source, dryRun = false) {
       if (this.innCompletionHandled && source === "inn-screen") {
         return false;
@@ -2630,7 +2657,8 @@ var devvit = (function() {
       safeSendMessage({
         type: "MISSION_COMPLETED",
         postId,
-        source: postId ? source : `${source}:no-postid-fallback`
+        source: postId ? source : `${source}:no-postid-fallback`,
+        telemetrySnapshot: this.telemetrySnapshot || null
       });
       return true;
     }
